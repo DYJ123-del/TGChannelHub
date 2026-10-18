@@ -163,6 +163,19 @@ Click any photo (single message or inside an album) to open a fullscreen viewer:
 - Counter (e.g. `3 / 31`), caption at bottom, ✕ to close
 - Videos keep their original behavior (open the `/watch` player page)
 
+## 📤 Upload center (personal cloud drive)
+
+Turn a Telegram group into a personal cloud drive: upload NAS files straight to your group/channel and watch them back through this UI.
+
+- **Path**: `/upload` (admin password protected; link on the admin page)
+- **File browser**: browse directories under `UPLOAD_ROOT` (compose volume), multi-select files or whole folders (recursive)
+- **Destination**: dropdown of all your groups/channels (via `get_dialogs`), or type `@username` / chat_id (e.g. the group `5523484915`)
+- **Queue**: adjustable concurrency (1–16 files at once), pause/resume, cancel single queued tasks
+- **Parallel speed-up**: files >10MB upload as 512KB chunks × 8 concurrent (`SaveBigFilePart` + `InputFileBig`) — ~4× faster than serial upload
+- **Live progress**: progress bar, % / MB/s / elapsed, refreshed every 2s
+- **Watch mode**: monitor a directory; new files auto-enqueue (mtime-stable check, auto `#tag` by parent dir name)
+- Proxy/credentials are injected via compose env vars (`TG_PROXY_TYPE` supports `http`/`socks5`); the upload engine reuses the main client — no separate login, no session conflicts.
+
 ## 🛠 Development / Local run
 
 ```bash
