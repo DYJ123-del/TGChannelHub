@@ -1,7 +1,7 @@
 # channel_ui.py — 频道代理 Web UI（在 tgfilestream 内核上新增）
 # 路由：/ (列表页,鉴权)  /login (POST 密码)  /list (JSON 分页,鉴权)
 #       /thumb/{id} (缩略图,鉴权)  /watch/{id}/{name} (播放页,不鉴权)  /s/{id}/{name} (频道流式,Range)
-import hashlib, logging, os
+import hashlib, logging, os, time
 from typing import cast
 
 from aiohttp import web
@@ -19,7 +19,7 @@ routes = web.RouteTableDef()
 
 AUTH_COOKIE = "tgui_auth"
 ADMIN_COOKIE = "tgadmin_auth"
-COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 天
+COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 天（未启用；改为会话级 cookie 后浏览器关闭即失效）
 thumb_cache: dict = {}
 THUMB_CACHE_MAX = 500  # 内存缩略图缓存上限，防无限增长
 CHANNELS_FILE = "/app/data/channels.json"
@@ -238,18 +238,20 @@ async def _load_thumb_bytes(media, packed: int):
 
 @routes.get("/c/{channel:[^/]+}")
 async def channel_page(req: web.Request) -> web.Response:
-    """单频道分享入口：/c/<username> 直接显示该频道消息流（分享给别人的链接）。"""
+    """单频道分享入口：/c/<username> 直接显示该频道消息流（分享给别人的链接）。
+    ?tag=xxx 时按标签筛选（服务器端搜索）。"""
     if not _auth_ok(req):
         return web.Response(status=200, content_type="text/html", text=_login_html(req.path_qs))
     username = req.match_info["channel"]
     peer = await _get_peer(username)
     if not peer:
         return web.Response(status=404, text="频道不存在或未解析")
-    items, next_offset = await _fetch_page_with_groups(peer, username)
+    tag = (req.query.get("tag", "") or "").strip()
+    items, next_offset = await _fetch_page_with_groups(peer, username, search=tag)
     msgs = "".join(_render_group(it) if isinstance(it, dict) and "group" in it else _stream_item(it) for it in items)
     chan = await _get_chan_info(username)
     # 单频道分享链接：锁定当前频道，不显示切换条（show_all=False）
-    html = render_list_html(msgs, next_offset, peer, chan, username, show_all=False)
+    html = render_list_html(msgs, next_offset, peer, chan, username, show_all=False, tag=tag)
     return web.Response(status=200, content_type="text/html", text=html)
 
 
@@ -274,6 +276,7 @@ async def manage_page(req: web.Request) -> web.Response:
     """可视化管理页：增删频道、复制分享链接、改密码。管理密码保护。"""
     if not _admin_ok(req):
         return web.Response(status=200, content_type="text/html", text=ADMIN_LOGIN_HTML)
+    _load_channels()  # 容器重启后 _channel_list 为空，必须显式加载，否则管理页空白
     html = MANAGE_HTML.replace("__CHANNEL_ROWS__", "\n".join(_manage_row(c) for c in _channel_list))
     added = "[" + ",".join('"%s"' % c["username"] for c in _channel_list) + "]"
     html = html.replace("__ADDED_SET__", added)
@@ -444,8 +447,12 @@ async def list_api(req: web.Request) -> web.Response:
     peer = await _get_peer(username)
     if not peer:
         return web.json_response({"items": [], "next_offset": 0})
-    offset_id = int(req.query.get("offset_id", "0") or 0)
-    items, next_offset = await _fetch_page_with_groups(peer, username, offset_id)
+    try:
+        offset_id = int(req.query.get("offset_id", "0") or 0)
+    except ValueError:
+        offset_id = 0
+    tag = (req.query.get("tag", "") or "").strip()
+    items, next_offset = await _fetch_page_with_groups(peer, username, offset_id, search=tag)
     return web.json_response({"items": items, "next_offset": next_offset})
 
 
@@ -460,6 +467,109 @@ def _has_content(m) -> bool:
     return bool((m.message or "").strip())
 
 
+# 标签统计缓存：{username: {"ts": epoch, "tags": {tag: count}}}
+_tag_cache: dict = {}
+TAG_SCAN = 400   # 扫最近多少条提取标签
+TAG_CACHE_TTL = 600  # 10 分钟
+
+
+async def _tag_stats(peer, username: str) -> dict:
+    """统计频道消息中的 #标签 出现次数（扫最近 TAG_SCAN 条，缓存 TTL）。"""
+    import re as _re
+    now = time.time()
+    cached = _tag_cache.get(username)
+    if cached and now - cached["ts"] < TAG_CACHE_TTL:
+        return cached["tags"]
+    counts: dict = {}
+    try:
+        msgs = await client.get_messages(entity=_msg_entity(peer), limit=TAG_SCAN)
+        for m in msgs:
+            txt = (m.message or "") if m else ""
+            for t in _re.findall(r"#([\w\u4e00-\u9fff][\w\u4e00-\u9fff·\-]*)", txt):
+                t = t.strip()
+                if t and len(t) <= 24:
+                    counts[t] = counts.get(t, 0) + 1
+    except Exception as e:
+        log.warning(f"tag scan failed: {e}")
+    _tag_cache[username] = {"ts": now, "tags": counts}
+    return counts
+
+
+@routes.get("/tags")
+async def tags_api(req: web.Request) -> web.Response:
+    """频道标签统计：返回 {tags: [{tag, count}], top: 前 N 个}。"""
+    if not _auth_ok(req):
+        return web.Response(status=401, text="unauthorized")
+    username = _channel_from_req(req)
+    if not username:
+        return web.json_response({"tags": [], "top": []})
+    peer = await _get_peer(username)
+    if not peer:
+        return web.json_response({"tags": [], "top": []})
+    counts = await _tag_stats(peer, username)
+    # 过滤：只保留出现 >=2 次的高频标签，按次数降序
+    top = sorted(((v, k) for k, v in counts.items() if v >= 2), reverse=True)[:20]
+    return web.json_response({
+        "tags": [{"tag": k, "count": c} for c, k in top],
+        "total": len(counts),
+    })
+
+
+@routes.get("/tagsall")
+async def tags_all_api(req: web.Request) -> web.Response:
+    """全部标签（含低频，按出现次数降序），供标签云页使用。"""
+    if not _auth_ok(req):
+        return web.Response(status=401, text="unauthorized")
+    username = _channel_from_req(req)
+    if not username:
+        return web.json_response({"tags": []})
+    peer = await _get_peer(username)
+    if not peer:
+        return web.json_response({"tags": []})
+    counts = await _tag_stats(peer, username)
+    tags = sorted(((v, k) for k, v in counts.items()), reverse=True)
+    return web.json_response({"tags": [{"tag": k, "count": c} for c, k in tags]})
+
+
+@routes.get("/cloud")
+async def tag_cloud(req: web.Request) -> web.Response:
+    """全标签云页：列出频道所有 #标签（按次数降序），点击进入筛选。"""
+    if not _auth_ok(req):
+        return web.Response(status=200, content_type="text/html", text=_login_html(req.path_qs))
+    username = _channel_from_req(req)
+    if not username:
+        return web.Response(status=404, text="no channel")
+    peer = await _get_peer(username)
+    if not peer:
+        return web.Response(status=404, text="no peer")
+    import urllib.parse as _up
+    counts = await _tag_stats(peer, username)
+    tags = sorted(((v, k) for k, v in counts.items()), reverse=True)
+    u_enc = _up.quote(username)          # URL 编码（用户名来自 query，须防注入）
+    u_esc = username.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    chips = "".join(
+        '<a class="tg" href="/c/%s?tag=%s">#%s<span>%d</span></a>' % (
+            u_enc, _up.quote(t), t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"), c)
+        for c, t in tags[:60]
+    )
+    html = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>标签</title>
+<style>
+body{margin:0;background:#0e1621;color:#e1e3e6;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;padding:16px}
+h1{font-size:16px;margin:0 0 6px}.sub{color:#708499;font-size:12px;margin-bottom:14px}
+.tgs{display:flex;flex-wrap:wrap;gap:8px}
+.tg{display:inline-flex;align-items:center;gap:4px;background:#17212b;border:1px solid #1f2c38;border-radius:999px;padding:7px 13px;font-size:13px;color:#e1e3e6;text-decoration:none}
+.tg:hover{border-color:#5eb5f7;color:#fff}
+.tg span{background:#223248;border-radius:999px;padding:1px 8px;font-size:11px;color:#708499}
+.back{display:inline-block;margin-bottom:14px;color:#5eb5f7;text-decoration:none;font-size:13px}
+</style></head><body>
+<a class="back" href="/c/%s">← 返回频道</a>
+<h1># 全部标签</h1><div class="sub">点击标签只看该系列</div>
+<div class="tgs">%s</div>
+</body></html>""" % (u_esc, chips)
+    return web.Response(status=200, content_type="text/html", text=html)
+
+
 @routes.get("/more")
 async def more_api(req: web.Request) -> web.Response:
     """加载更多：返回预渲染 HTML 片段（{html, next}），前端直接 insertAdjacentHTML，避免 JS 拼 HTML 转义地狱。"""
@@ -471,8 +581,12 @@ async def more_api(req: web.Request) -> web.Response:
     peer = await _get_peer(username)
     if not peer:
         return web.json_response({"html": "", "next": 0})
-    offset_id = int(req.query.get("offset_id", "0") or 0)
-    items, next_offset = await _fetch_page_with_groups(peer, username, offset_id)
+    try:
+        offset_id = int(req.query.get("offset_id", "0") or 0)
+    except ValueError:
+        offset_id = 0
+    tag = (req.query.get("tag", "") or "").strip()
+    items, next_offset = await _fetch_page_with_groups(peer, username, offset_id, search=tag)
     frag = []
     for it in items:
         if isinstance(it, dict) and "group" in it:
@@ -551,16 +665,21 @@ def _collect_items(msgs: list, peer, username: str = "") -> tuple:
         # 组内按 id 升序（第一张 = 最新 id，与 TG 顺序一致：id 大 = 后发 = 在组内靠后位置）
         # TG 相册内 id 小的先发 → 排在左边/前面；这里保持消息列表顺序（id 降序）即第一张为 id 最大
         if len(group) > 1:
-            items.append({"group": group, "grouped": gid})
+            items.append({"group": group, "grouped": gid, "chan": username})
         else:
             items.append(group[0])
         i = j
     return items, next_offset
 
 
-async def _fetch_page_with_groups(peer, username: str, offset_id: int = 0) -> tuple:
-    """取一页消息，若末尾组未闭合则补拉更旧消息直到组完整。返回 (items, next_offset)。"""
-    msgs = await client.get_messages(entity=_msg_entity(peer), limit=PAGE_SIZE, offset_id=offset_id or 0)
+async def _fetch_page_with_groups(peer, username: str, offset_id: int = 0, search: str = "") -> tuple:
+    """取一页消息，若末尾组未闭合则补拉更旧消息直到组完整。返回 (items, next_offset)。
+    search 非空时按标签/关键词服务器端搜索（get_messages(search=...)），分页同样带 search。
+    Telegram 标签搜索需要 # 前缀，自动补。"""
+    if search and not search.startswith("#"):
+        search = "#" + search
+    kw = dict(search=search) if search else {}
+    msgs = await client.get_messages(entity=_msg_entity(peer), limit=PAGE_SIZE, offset_id=offset_id or 0, **kw)
     msgs = list(msgs)
     # 补拉：只要最后一条仍属于某组（且组内还有更旧成员未取到），继续向旧拉
     # 简化：取到最后一组完整为止（最多补 3 次）
@@ -573,7 +692,7 @@ async def _fetch_page_with_groups(peer, username: str, offset_id: int = 0) -> tu
             break
         # 检查组内是否还有更旧的同组成员未取到（组可能跨页）
         # 稳妥做法：直接多取一页，若新页第一条的同组 ID 与 last 相同则继续
-        extra = await client.get_messages(entity=_msg_entity(peer), limit=PAGE_SIZE, offset_id=last.id)
+        extra = await client.get_messages(entity=_msg_entity(peer), limit=PAGE_SIZE, offset_id=last.id, **kw)
         extra = list(extra)
         if not extra:
             break
@@ -606,13 +725,15 @@ async def thumb(req: web.Request) -> web.Response:
         return web.Response(status=401, text="unauthorized")
     packed = int(req.match_info["id"])
     msg_id = (packed >> msg_id_offset) & pack_bit_mask
-    if msg_id in thumb_cache:
-        data, mime = thumb_cache[msg_id]
-        return web.Response(body=data, content_type=mime,
-                            headers={"Cache-Control": "public, max-age=86400"})
+    # 先校验频道再查缓存（缓存 key 含 c，避免跨频道串台 + 无 c 也能命中）
     c = req.query.get("c", "").strip()
     if not c:
         return web.Response(status=404, text="no channel")
+    ckey = f"{msg_id}:{c}"
+    if ckey in thumb_cache:
+        data, mime = thumb_cache[ckey]
+        return web.Response(body=data, content_type=mime,
+                            headers={"Cache-Control": "public, max-age=86400"})
     peer = await _get_peer(c)
     if not peer:
         return web.Response(status=404, text="no peer")
@@ -628,7 +749,7 @@ async def thumb(req: web.Request) -> web.Response:
         return web.Response(status=404, text="no thumb")
     if len(thumb_cache) >= THUMB_CACHE_MAX:
         thumb_cache.pop(next(iter(thumb_cache)))  # 超上限丢最早一条
-    thumb_cache[msg_id] = (data, "image/jpeg")
+    thumb_cache[ckey] = (data, "image/jpeg")
     return web.Response(body=data, content_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=86400"})
 
@@ -694,13 +815,14 @@ async def login(req: web.Request) -> web.Response:
     data = await req.post()
     pw = data.get("password", "")
     next_url = (data.get("next") or "/c").strip()
-    # 防开放重定向：只允许站内路径
-    if not next_url.startswith("/") or next_url.startswith("//"):
+    # 防开放重定向：仅允许站内相对路径（必须以单个 / 开头、不含反斜杠、非 // 协议相对）
+    if not next_url.startswith("/") or next_url.startswith("//") or "\\" in next_url or "://" in next_url:
         next_url = "/c"
     if pw == ui_password:
         val = hashlib.sha256(("tgui:" + ui_password).encode()).hexdigest()
         resp = web.Response(status=302, headers={"Location": next_url})
-        resp.set_cookie(AUTH_COOKIE, val, max_age=COOKIE_MAX_AGE, httponly=True, samesite="Lax")
+        # 会话级 cookie（不设 max_age）：浏览器关闭即失效，退出后需重新输密码
+        resp.set_cookie(AUTH_COOKIE, val, httponly=True, samesite="Lax")
         return resp
     return web.Response(status=200, content_type="text/html",
                         text=_login_html(next_url, err=True))
@@ -714,7 +836,8 @@ async def admin_login(req: web.Request) -> web.Response:
     if pw == admin_password:
         val = hashlib.sha256(("tgadmin:" + admin_password).encode()).hexdigest()
         resp = web.Response(status=302, headers={"Location": "/manage"})
-        resp.set_cookie(ADMIN_COOKIE, val, max_age=COOKIE_MAX_AGE, httponly=True, samesite="Lax")
+        # 会话级 cookie（不设 max_age）：浏览器关闭即失效，退出后需重新输密码
+        resp.set_cookie(ADMIN_COOKIE, val, httponly=True, samesite="Lax")
         return resp
     return web.Response(status=200, content_type="text/html",
                         text=ADMIN_LOGIN_HTML.replace("</form>", "<p style='color:#f87171;margin-top:12px'>密码错误</p></form>"))
@@ -732,12 +855,14 @@ async def watch_page(req: web.Request) -> web.Response:
     peer = await _get_peer(c)
     if not peer:
         return web.Response(status=404, text="404: Not Found")
+    import urllib.parse as _up
+    c_q = _up.quote(c)      # URL 编码（防属性注入；_get_peer 已挡非法名，双保险）
     msg_id = (packed >> msg_id_offset) & pack_bit_mask
     m = cast(Message, await client.get_messages(entity=_msg_entity(peer), ids=msg_id))
     if not m or not m.media:
         return web.Response(status=404, text="404: Not Found")
     size = getattr(getattr(m.media, "document", None) or m.media, "size", 0)
-    q = "?c=" + c
+    q = "?c=" + c_q
     stream = f"/s/{packed}/{name}{q}"
     thumb_url = f"/thumb/{packed}{q}"
     is_photo = _thumb_kind(m.media) == "photo"
@@ -749,7 +874,7 @@ async def watch_page(req: web.Request) -> web.Response:
                   'x5-playsinline x5-video-player-type="h5" src="%s"></video>') % stream
     dl_hint = ""  # 用户要求不提供下载按钮
     name_esc = name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    back_href = "/c/" + c  # 返回频道页（根路径是管理入口，不能回 /）
+    back_href = "/c/" + c_q  # 返回频道页（URL 已编码，根路径是管理入口不能回 /）
     html = f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{name_esc}</title>
@@ -770,10 +895,11 @@ video{{width:100%;border-radius:12px;background:#000;box-shadow:0 8px 30px rgba(
     return web.Response(status=200, content_type="text/html", text=html)
 
 
-def render_list_html(msgs_html: str, next_offset: int, peer, chan: dict = None, username: str = "", show_all: bool = False) -> str:
+def render_list_html(msgs_html: str, next_offset: int, peer, chan: dict = None, username: str = "", show_all: bool = False, tag: str = "") -> str:
     """渲染频道消息页。
     show_all=True：显示频道切换条（分享 /c 时，所有频道可切换）；
     show_all=False：锁定当前频道（分享 /c/<频道> 时，仅浏览单频道，无切换条、无管理入口）。
+    tag 非空：标签筛选态，标签栏高亮当前标签。
     """
     chan = chan or {"name": "频道", "subs": "", "avatar": "/avatar"}
     msgs = msgs_html
@@ -807,7 +933,8 @@ def render_list_html(msgs_html: str, next_offset: int, peer, chan: dict = None, 
                 .replace("__CHAN_SWITCH__", switch)
                 .replace("__CHAN__", username.replace("\\", "\\\\").replace('"', '\\"'))
                 .replace("__DISPLAY_SWITCH__", "flex" if (show_all and len(_channel_list) > 1) else "none")
-                .replace("__CHAN_URL__", "/c/%s" % (username or "?")))
+                .replace("__CHAN_URL__", "/c/%s" % (username or "?"))
+                .replace("__CURTAG__", tag.replace("\\", "\\\\").replace('"', '\\"')))
     return html
 
 
@@ -848,6 +975,22 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang S
 /* 文字区 */
 .msg .body{padding:10px 12px 12px}
 .msg .cap{font-size:14px;line-height:1.55;color:var(--txt);word-break:break-word;white-space:pre-wrap;margin:0}
+.msg .cap a.hash{color:var(--acc);text-decoration:none;font-weight:500}
+.msg .cap a.hash:active{opacity:.7}
+/* 图片 lightbox 查看器 */
+#lb{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.94);display:none;flex-direction:column;align-items:center;justify-content:center;touch-action:none;user-select:none;-webkit-user-select:none}
+#lb.open{display:flex}
+#lb img.lb-img{max-width:96vw;max-height:82vh;object-fit:contain;border-radius:6px;background:#000;box-shadow:0 8px 40px rgba(0,0,0,.6)}
+#lb .lb-top{position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:center;padding:14px 18px;color:#fff;font-size:13px;z-index:2}
+#lb .lb-x{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.12);border:none;color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+#lb .lb-x:active{background:rgba(255,255,255,.25)}
+#lb .lb-nav{position:absolute;top:50%;transform:translateY(-50%);width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.12);border:none;color:#fff;font-size:22px;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:2}
+#lb .lb-nav:active{background:rgba(255,255,255,.25)}
+#lb .lb-prev{left:12px}
+#lb .lb-next{right:12px}
+#lb .lb-cap{position:absolute;bottom:0;left:0;right:0;padding:14px 18px 22px;color:#cfd6e0;font-size:13px;line-height:1.5;background:linear-gradient(transparent,rgba(0,0,0,.75));max-height:22vh;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
+#lb .lb-idx{color:#9fb0c3;margin-right:12px}
+@media(max-width:600px){#lb .lb-nav{width:36px;height:36px;font-size:18px}#lb img.lb-img{max-height:78vh}}
 .msg .meta{display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:12px;color:var(--sub)}
 .msg .meta .date{color:var(--sub)}
 /* 加载提示 */
@@ -855,6 +998,14 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang S
 .refresh-btn{background:transparent;border:1px solid var(--border);color:var(--sub);border-radius:8px;padding:5px 12px;font-size:12px;cursor:pointer}
 .refresh-btn:hover{color:var(--txt);border-color:#314a63}
 .btn-mini{background:transparent;border:1px solid var(--border);color:var(--sub);border-radius:8px;padding:5px 9px;font-size:13px;cursor:pointer;text-decoration:none;line-height:1.4}
+/* 标签栏（横向滚动 chips） */
+.tagbar{position:sticky;top:61px;z-index:20;display:flex;gap:8px;overflow-x:auto;padding:8px 16px;background:rgba(14,22,33,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);scrollbar-width:none}
+.tagbar::-webkit-scrollbar{display:none}
+.tag{flex-shrink:0;font-size:12px;color:var(--sub);background:var(--panel);border:1px solid var(--border);border-radius:999px;padding:5px 13px;text-decoration:none;white-space:nowrap}
+.tag:hover{color:var(--txt)}
+.tag.on{color:#0e1621;background:var(--acc);border-color:var(--acc);font-weight:600}
+.tag .cnt{opacity:.7;margin-left:3px;font-size:11px}
+.tag-clear{color:#f87171;border-color:#5b1e1e}
 .btn-mini:hover{color:var(--txt);border-color:#314a63}
 .ops{display:flex;align-items:center;gap:8px;margin-left:auto}
 .chanswitch{position:sticky;top:61px;z-index:20;display:flex;gap:8px;overflow-x:auto;padding:8px 16px;background:rgba(14,22,33,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);scrollbar-width:none}
@@ -891,10 +1042,13 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang S
 <button class="refresh-btn" onclick="location.reload()">刷新</button>
 </div>
 <div class="chanswitch" id="chanswitch" style="display:__DISPLAY_SWITCH__">__CHAN_SWITCH__</div>
+<div class="tagbar" id="tagbar" style="display:none"></div>
 <div class="feed" id="feed">__MSGS__</div>
 <div class="loading" id="sentinel" data-next="__FIRST_NEXT__" style="display:__DISPLAY__">↑ 上滑加载更多 ↑</div>
+<div id="lb"><div class="lb-top"><span class="lb-idx" id="lbIdx"></span><button class="lb-x" onclick="lbClose()">✕</button></div><button class="lb-nav lb-prev" onclick="lbPrev()">‹</button><img class="lb-img" id="lbImg" alt=""><button class="lb-nav lb-next" onclick="lbNext()">›</button><div class="lb-cap" id="lbCap"></div></div>
 <script>
 const CHAN="__CHAN__";
+const CURTAG="__CURTAG__";
 const feed=document.getElementById('feed'), sentinel=document.getElementById('sentinel');
 let loading=false;
 function updCount(){
@@ -902,7 +1056,57 @@ function updCount(){
   if(c) c.textContent=feed.querySelectorAll('.msg').length+' 条消息';
 }
 updCount();
+// —— 图片 Lightbox：点击图片全屏浏览，左右滑动/箭头/键盘切换上一张下一张 ——
+let lbPhotos=[], lbIdx=0, lbX=0;
+function lbCollect(){
+  lbPhotos=[];
+  // 单条图片消息
+  feed.querySelectorAll('.msg[data-watch] .media.photo img').forEach(img=>{
+    const m=img.closest('.msg');
+    const cap=m.querySelector('.cap')?m.querySelector('.cap').textContent.trim():'';
+    lbPhotos.push({src:img.src, watch:m.dataset.watch, cap});
+  });
+  // 相册组里的图片格
+  feed.querySelectorAll('.msg.album a.at img[alt="图片"]').forEach(img=>{
+    const a=img.closest('a.at');
+    const cap=a.closest('.msg.album')?((a.closest('.msg.album').querySelector('.cap')||{}).textContent||'').trim():'';
+    lbPhotos.push({src:img.src, watch:a.href, cap});
+  });
+}
+function lbShow(){
+  const p=lbPhotos[lbIdx]; if(!p) return;
+  const im=document.getElementById('lbImg'); im.src=p.src; im.alt='图片';
+  const cap=document.getElementById('lbCap'); cap.textContent=p.cap||'';
+  document.getElementById('lbIdx').textContent=(lbIdx+1)+' / '+lbPhotos.length;
+  document.getElementById('lb').classList.add('open');
+}
+function lbOpenFrom(imgEl){
+  lbCollect();
+  // 找该图在收集列表中的位置（src 相同）
+  lbIdx=lbPhotos.findIndex(p=>p.src===imgEl.src); if(lbIdx<0) lbIdx=0;
+  lbShow();
+}
+function lbClose(){ document.getElementById('lb').classList.remove('open'); }
+function lbPrev(){ if(lbPhotos.length<2) return; lbIdx=(lbIdx-1+lbPhotos.length)%lbPhotos.length; lbShow(); }
+function lbNext(){ if(lbPhotos.length<2) return; lbIdx=(lbIdx+1)%lbPhotos.length; lbShow(); }
+// 键盘左右
+document.addEventListener('keydown',e=>{
+  if(!document.getElementById('lb').classList.contains('open')) return;
+  if(e.key==='ArrowLeft') lbPrev(); else if(e.key==='ArrowRight') lbNext(); else if(e.key==='Escape') lbClose();
+});
+// 触摸左右滑动
+const lbEl=document.getElementById('lb');
+lbEl.addEventListener('touchstart',e=>{ lbX=e.touches[0].clientX; },{passive:true});
+lbEl.addEventListener('touchend',e=>{
+  const dx=e.changedTouches[0].clientX-lbX;
+  if(Math.abs(dx)>48){ dx<0?lbNext():lbPrev(); }
+},{passive:true});
 feed.addEventListener('click',e=>{
+  // 点击图片 → 打开 lightbox（单条 photo 或相册组里的图片格）
+  const pimg=e.target.closest('.media.photo img, .msg.album a.at img[alt="图片"]');
+  if(pimg){ e.preventDefault(); lbOpenFrom(pimg); return; }
+  // 点击 caption 内的 #标签 链接：走默认 a 跳转，不拦截为 watch
+  const a=e.target.closest('a'); if(a) return;
   const m=e.target.closest('.msg'); if(m&&m.dataset.watch) location.href=m.dataset.watch;
 });
 async function loadMore(){
@@ -910,13 +1114,31 @@ async function loadMore(){
   const off=sentinel.dataset.next; if(!off){loading=false;return}
   sentinel.textContent='加载中…';
   try{
-    const r=await fetch('/more?offset_id='+off+'&c='+encodeURIComponent(CHAN)); const d=await r.json();
+    const tg=CURTAG?('&tag='+encodeURIComponent(CURTAG)):'';
+    const r=await fetch('/more?offset_id='+off+'&c='+encodeURIComponent(CHAN)+tg); const d=await r.json();
     if(d.next===0){sentinel.textContent='— 到底了 —';sentinel.dataset.next='';loading=false;return}
     feed.insertAdjacentHTML('beforeend',d.html);
     sentinel.dataset.next=d.next; sentinel.textContent='↑ 上滑加载更多 ↑';
     updCount();
   }catch(e){sentinel.textContent='加载失败，继续下滑重试';}
   loading=false;
+}
+// 标签栏：拉取频道高频标签，渲染 chips；点击进入标签筛选视图
+async function loadTags(){
+  const bar=document.getElementById('tagbar'); if(!bar) return;
+  try{
+    const r=await fetch('/tags?c='+encodeURIComponent(CHAN)); const d=await r.json();
+    if(!d.tags || !d.tags.length){return;}
+    let html='';
+    if(CURTAG){html+='<a class="tag tag-clear" href="/c/'+encodeURIComponent(CHAN)+'">✕ 全部</a>';}
+    for(const t of d.tags){
+      const on=(CURTAG===t.tag)?' on':'';
+      const ts=String(t.tag).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+      html+='<a class="tag'+on+'" href="/c/'+encodeURIComponent(CHAN)+'?tag='+encodeURIComponent(t.tag)+'">#'+ts+'<span class="cnt">'+t.count+'</span></a>';
+    }
+    html+='<a class="tag" href="/cloud?c='+encodeURIComponent(CHAN)+'">🔍 全部标签</a>';
+    bar.innerHTML=html; bar.style.display='flex';
+  }catch(e){/* 标签加载失败静默，不影响主流程 */}
 }
 function nearBottom(){ return sentinel.getBoundingClientRect().top < window.innerHeight + 300; }
 let ticking=false;
@@ -931,11 +1153,28 @@ if('IntersectionObserver' in window){
 }
 const iv=setInterval(checkLoad, 1200);
 window.addEventListener('load',checkLoad);
+loadTags();
 </script></body></html>"""
 
 
 
 
+
+
+def _linkify_tags(caption_html: str, chan: str) -> str:
+    """把 caption HTML 中的 #标签 转为可点击链接（跳标签筛选视图）。
+    输入已是 HTML 转义后的字符串，正则匹配 #中文/英文标签。"""
+    import re as _re
+    import urllib.parse as _up
+    if not chan:
+        return caption_html
+    chan_enc = _up.quote(chan)
+    def _rep(m: _re.Match) -> str:
+        t = m.group(1)
+        href = "/c/%s?tag=%s" % (chan_enc, _up.quote(t))
+        return '<a class="hash" href="%s">#%s</a>' % (href, t)
+    # 标签规则：#后跟中文/字母/数字/·-，到空白或结尾；# 前不得是 &（避免破坏 &#35; 等 HTML 实体）
+    return _re.sub(r"(?<![&])#([\w\u4e00-\u9fff][\w\u4e00-\u9fff·\-]*)", _rep, caption_html)
 
 
 def _stream_item(it: dict) -> str:
@@ -945,6 +1184,10 @@ def _stream_item(it: dict) -> str:
     name = it["name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     caption = it.get("caption") or ""
     caption = caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+    # #标签 → 可点击链接（跳标签筛选），频道名从 watch URL 提取
+    import urllib.parse as _up
+    _chan = _up.parse_qs(_up.urlsplit(it.get("watch", "")).query).get("c", [""])[0]
+    caption = _linkify_tags(caption, _chan)
     watch = it["watch"]
     kind = it.get("kind", "video")
     if kind == "text":
@@ -1008,7 +1251,9 @@ def _render_group(grp: dict) -> str:
         else:
             tile = ""
         items.append(tile)
-    cap_html = ('<div class="cap">%s</div>' % caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")) if caption else ""
+    cap_html = ('<div class="cap">%s</div>' % _linkify_tags(
+        caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>"),
+        grp.get("chan", ""))) if caption else ""
     meta = '<div class="meta"><span>%s · %d 张</span><span class="date">%s</span></div>' % (_fmt_size(total_size), len(group_sorted), group_sorted[-1]["date"])
     return ('<div class="msg album">'
             '<div class="agrid n%d">%s</div>%s%s</div>') % (
