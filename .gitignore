@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 凭证与数据（绝不上传）
+*.session
+*.session-journal
+data/
+cache/
+passwords.json
+channels.json
+login_state.json
+.env
+
+# 系统/编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp
