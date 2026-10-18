@@ -10,7 +10,7 @@ except IOError:
 setuptools.setup(
     name="channelrelay",
     version=__version__,
-    url="https://github.com/<your-username>/channelrelay",
+    url="https://github.com/DYJ123-del/TGChannelHub",
 
     author="ChannelRelay contributors",
     author_email="",

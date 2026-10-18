@@ -287,15 +287,17 @@ async def manage_page_alias(req: web.Request) -> web.Response:
 
 
 def _share_url(username: str) -> str:
-    """频道分享链接（公网 URL）。"""
+    """频道分享链接（公网 URL）。PUBLIC_URL 未配置时退化为相对路径。"""
     if not username:
         return ""
     try:
         from .config import public_url
         base = str(public_url).rstrip("/")
+        if base.startswith("http"):
+            return f"{base}/c/{username}"
     except Exception:
-        base = "http://TG_PUBLIC_DOMAIN:56200"
-    return f"{base}/c/{username}"
+        pass
+    return f"/c/{username}"
 
 
 def _manage_row(c: dict) -> str:
