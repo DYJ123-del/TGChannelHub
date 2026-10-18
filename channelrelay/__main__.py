@@ -21,6 +21,8 @@ from telethon import functions
 
 from .telegram import client, transfer
 from .channel_ui import routes as ui_routes
+from .uploader.routes import routes as uploader_routes
+from .uploader import UploadEngine
 from .config import host, port, public_url, tg_bot_token
 from .log import log
 
@@ -28,6 +30,10 @@ server = web.Application()
 # 原版无鉴权路由（/{id}/{name} 直链流）已弃用——存在未授权访问与 Content-Range off-by-one 问题，
 # 全部播放/下载走 channel_ui（/s/ 等，带分享密码鉴权）。不注册原版 routes。
 server.add_routes(ui_routes)
+server.add_routes(uploader_routes)
+
+# 上传引擎单例（注入主 client，启动时开始 worker；watch 由页面 API 控制）
+upload_engine: UploadEngine = None
 runner = web.AppRunner(server)
 
 loop = asyncio.get_event_loop()
@@ -45,6 +51,13 @@ async def start() -> None:
             client.session.save()
             break
     transfer.post_init()
+
+    # 初始化上传引擎并启动 worker
+    from .uploader.routes import initialize_engine
+    global upload_engine
+    upload_engine = initialize_engine(client)
+    await upload_engine.start()
+    log.info("Upload engine started")
 
     # 预热 DC 连接：启动时建立主 DC 连接池，避免首次播放等待 2-4s 建连（启动慢根因）
     try:

@@ -1,0 +1,230 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>上传中心</title>
+<style>
+:root{--bg:#0e1621;--card:#17212b;--line:#1f2c38;--txt:#e1e3e6;--sub:#708499;--blue:#5eb5f7;--green:#86efac;--red:#f87171;--amber:#fbbf24}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;padding:16px;min-height:100vh}
+a{color:var(--blue);text-decoration:none}
+h1{font-size:18px;margin-bottom:4px}
+.sub{color:var(--sub);font-size:13px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}
+.card h2{font-size:14px;margin-bottom:10px;color:var(--blue)}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.btn{background:#2563eb;border:none;border-radius:8px;color:#fff;font-size:13px;padding:8px 14px;cursor:pointer}
+.btn:hover{background:#1d4ed8}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.gray{background:#2a3a49;color:var(--txt)}
+.btn.gray:hover{background:#36475c}
+.btn.danger{background:transparent;border:1px solid #5f3a3a;color:var(--red)}
+.btn.green{background:#16a34a}
+input,select{background:#0e1621;border:1px solid #2a3a49;border-radius:8px;color:var(--txt);padding:8px 10px;font-size:13px;outline:none}
+input:focus,select:focus{border-color:var(--blue)}
+input[type=number]{width:70px}
+.pathbar{display:flex;gap:8px;margin-bottom:10px}
+.pathbar input{flex:1}
+.pathbar .btn{flex-shrink:0}
+.browser{max-height:320px;overflow-y:auto;border:1px solid var(--line);border-radius:10px;background:#0e1621}
+.bitem{display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--line);cursor:pointer;font-size:13px}
+.bitem:hover{background:#1a2634}
+.bitem .nm{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bitem .sz{color:var(--sub);font-size:12px;flex-shrink:0}
+.bitem .ck{width:16px;height:16px;accent-color:var(--blue);flex-shrink:0}
+.bitem.dir .nm{color:var(--blue);font-weight:600}
+.selinfo{font-size:12px;color:var(--sub);margin:8px 0}
+.tasks{max-height:400px;overflow-y:auto}
+.task{background:#0e1621;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px}
+.task .top{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.task .nm{flex:1;min-width:0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.task .st{font-size:11px;flex-shrink:0;padding:2px 8px;border-radius:999px}
+.task .st.waiting{background:rgba(94,181,247,.12);color:var(--blue)}
+.task .st.uploading{background:rgba(251,191,36,.15);color:var(--amber)}
+.task .st.done{background:rgba(134,239,172,.12);color:var(--green)}
+.task .st.failed{background:rgba(248,113,113,.12);color:var(--red)}
+.task .st.paused{background:rgba(112,132,153,.15);color:var(--sub)}
+.task .st.cancelled{background:rgba(112,132,153,.15);color:var(--sub)}
+.pbar{height:6px;background:#1f2c38;border-radius:3px;overflow:hidden}
+.pbar .fill{height:100%;background:linear-gradient(90deg,#2563eb,#5eb5f7);border-radius:3px;transition:width .5s}
+.task .meta{font-size:11px;color:var(--sub);margin-top:5px;display:flex;gap:12px;flex-wrap:wrap}
+.task .err{font-size:11px;color:var(--red);margin-top:5px;word-break:break-all}
+.statbar{display:flex;gap:16px;font-size:12px;color:var(--sub);flex-wrap:wrap}
+.statbar b{color:var(--txt)}
+.watchline{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center}
+#msg{color:var(--red);font-size:12px;margin-top:8px;min-height:16px}
+.lbl{font-size:12px;color:var(--sub)}
+@media(max-width:600px){body{padding:10px}}
+</style></head><body>
+<h1>📤 上传中心</h1>
+<div class="sub">将 NAS 文件上传到 Telegram 群组/频道（个人网盘）。<a href="/manage">← 返回管理</a></div>
+
+<div class="card">
+  <h2>📂 选择文件 / 文件夹</h2>
+  <div class="pathbar">
+    <input id="pathInp" placeholder="/upload">
+    <button class="btn gray" onclick="browse()">打开</button>
+    <button class="btn gray" onclick="upDir()">⬆ 上级</button>
+    <button class="btn gray" onclick="refreshBrowse()">🔄 刷新</button>
+  </div>
+  <div class="browser" id="browser"><div style="padding:12px;color:var(--sub);font-size:13px">加载中…</div></div>
+  <div class="selinfo" id="selInfo">未选择文件</div>
+  <div class="row">
+    <select id="destSel" style="flex:1;min-width:200px"><option value="">加载目的地…</option></select>
+    <input id="tagInp" placeholder="标签（自动 #）" style="width:140px">
+    <button class="btn green" onclick="enqueue()">⬆ 加入上传</button>
+  </div>
+  <div style="font-size:11px;color:var(--sub);margin-top:6px">目的地=你账号下的群组/频道（下拉加载）；也可输入 @用户名 或 chat_id（如 5523484915）</div>
+</div>
+
+<div class="card">
+  <h2>⚙️ 任务控制</h2>
+  <div class="row">
+    <span class="lbl">并发文件数</span>
+    <input type="number" id="concInp" value="3" min="1" max="16" onchange="setConc()">
+    <button class="btn gray" id="pauseBtn" onclick="togglePause()">⏸ 暂停</button>
+    <button class="btn gray" onclick="clearDone()">🧹 清除已完成</button>
+  </div>
+  <div class="statbar" style="margin-top:8px">
+    <span>总任务 <b id="stTotal">0</b></span>
+    <span>上传中 <b id="stRun">0</b></span>
+    <span>排队 <b id="stWait">0</b></span>
+    <span>完成 <b id="stDone">0</b></span>
+    <span>失败 <b id="stFail">0</b></span>
+    <span id="stPause" style="display:none;color:var(--amber)">⏸ 已暂停</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>🚀 实时监控（新文件自动上传）</h2>
+  <div class="row">
+    <input id="watchDir" placeholder="监控目录（UPLOAD_ROOT 内）" style="flex:1;min-width:200px">
+    <button class="btn gray" onclick="setWatchDir()">📂 用当前目录</button>
+    <select id="watchDestSel" style="width:170px"><option value="">目的地…</option></select>
+    <input id="watchTag" placeholder="标签" style="width:100px">
+    <input type="number" id="watchInt" value="30" min="5" style="width:60px" title="扫描间隔秒">
+    <button class="btn green" id="watchBtn" onclick="toggleWatch()">▶ 开启监控</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>📋 任务列表</h2>
+  <div class="tasks" id="tasks"></div>
+</div>
+<div id="msg"></div>
+
+<script>
+let curPath = "/upload";
+let selected = new Map(); // path -> {name,size,dir}
+let paused = false;
+let watchOn = false;
+
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function fmtSize(n){if(!n)return'0B';const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(n>=100||i===0?0:1)+u[i]}
+function api(url,opt){return fetch(url,opt).then(r=>r.json())}
+
+async function browse(p){curPath = p || document.getElementById('pathInp').value || '/upload'; await refreshBrowse()}
+async function refreshBrowse(){
+  const d = await api('/up/api/browse?path='+encodeURIComponent(curPath));
+  if(d.error){msg(d.error);return}
+  document.getElementById('pathInp').value = d.path;
+  let html='';
+  for(const dir of d.dirs){
+    const isSel = selected.has(dir.path);
+    html += `<div class="bitem dir" onclick="enterDir('${esc(dir.path)}')">
+      <input type="checkbox" class="ck" ${isSel?'checked':''} onclick="event.stopPropagation();toggleSel('${esc(dir.path)}','${esc(dir.name)}',0,true)" onchange="updateSelInfo()">
+      <span class="nm">📁 ${esc(dir.name)}</span></div>`;
+  }
+  for(const f of d.files){
+    const isSel = selected.has(f.path);
+    html += `<div class="bitem" onclick="toggleSel('${esc(f.path)}','${esc(f.name)}',${f.size},false)">
+      <input type="checkbox" class="ck" ${isSel?'checked':''} onclick="event.stopPropagation();toggleSel('${esc(f.path)}','${esc(f.name)}',${f.size},false)" onchange="updateSelInfo()">
+      <span class="nm">🎬 ${esc(f.name)}</span><span class="sz">${fmtSize(f.size)}</span></div>`;
+  }
+  document.getElementById('browser').innerHTML = html || '<div style="padding:12px;color:var(--sub)">空目录</div>';
+  updateSelInfo();
+}
+function enterDir(p){curPath=p;refreshBrowse()}
+function upDir(){curPath = curPath.split('/').slice(0,-1).join('/') || '/';refreshBrowse()}
+function toggleSel(path,name,size,isDir){
+  if(selected.has(path))selected.delete(path);else selected.set(path,{name,size,isDir});
+  refreshBrowse();
+}
+function updateSelInfo(){
+  const n = selected.size, s=[...selected.values()].reduce((a,b)=>a+b.size,0);
+  document.getElementById('selInfo').textContent = n?`已选 ${n} 项，合计 ${fmtSize(s)}（勾选文件夹=递归全部文件）`:'未选择文件';
+}
+async function loadDests(){
+  const d = await api('/up/api/dests');
+  if(!d.ok){msg('加载目的地失败: '+(d.error||''));return}
+  const opts = d.items.map(i=>`<option value="${esc(i.value)}">${esc(i.kind)} · ${esc(i.name)}</option>`).join('');
+  document.getElementById('destSel').innerHTML = '<option value="">选择目的地…（也可手输）</option>' + opts;
+  document.getElementById('watchDestSel').innerHTML = '<option value="">选择目的地…</option>' + opts;
+}
+async function enqueue(){
+  const files=[...selected.keys()], dest=document.getElementById('destSel').value.trim(), tag=document.getElementById('tagInp').value.trim();
+  if(!files.length){msg('请先选择文件/文件夹');return}
+  if(!dest){msg('请选择或输入目的地（@群组 或 chat_id）');return}
+  const r = await api('/up/api/enqueue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files,dest,tag})});
+  if(r.error){msg(r.error);return}
+  selected.clear();updateSelInfo();msg(`已加入 ${r.added} 个任务`);
+}
+function setWatchDir(){
+  document.getElementById('watchDir').value = curPath;
+  msg('已填入当前目录：'+curPath);
+}
+async function setConc(){const v=parseInt(document.getElementById('concInp').value)||3;await api('/up/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_concurrent:v})})}
+async function togglePause(){
+  paused=!paused;
+  await api('/up/api/'+(paused?'pause':'resume'),{method:'POST'});
+  document.getElementById('pauseBtn').textContent = paused?'▶ 继续':'⏸ 暂停';
+}
+async function cancelTask(id){await api('/up/api/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})}
+function clearDone(){}
+async function toggleWatch(){
+  if(watchOn){
+    await api('/up/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:false})});
+    watchOn=false;document.getElementById('watchBtn').textContent='▶ 开启监控';
+  }else{
+    const dir=document.getElementById('watchDir').value.trim(), dest=document.getElementById('watchDestSel').value.trim();
+    const tag=document.getElementById('watchTag').value.trim(), int=parseInt(document.getElementById('watchInt').value)||30;
+    if(!dir||!dest){msg('监控需要目录+目的地');return}
+    const r=await api('/up/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:true,dir,dest,tag,interval:int})});
+    if(r.error){msg(r.error);return}
+    watchOn=true;document.getElementById('watchBtn').textContent='⏹ 关闭监控';
+  }
+}
+function msg(s){document.getElementById('msg').textContent=s}
+function render(data){
+  const s=data.summary, tasks=data.tasks;
+  document.getElementById('stTotal').textContent=s.total;
+  document.getElementById('stRun').textContent=s.by_status.uploading||0;
+  document.getElementById('stWait').textContent=s.by_status.waiting||0;
+  document.getElementById('stDone').textContent=s.by_status.done||0;
+  document.getElementById('stFail').textContent=s.by_status.failed||0;
+  document.getElementById('stPause').style.display = s.paused?'inline':'none';
+  if(!s.paused && paused){paused=false;document.getElementById('pauseBtn').textContent='⏸ 暂停'}
+  if(s.watch && s.watch.active && !watchOn){
+    watchOn=true;document.getElementById('watchBtn').textContent='⏹ 关闭监控';
+    document.getElementById('watchDir').value = s.watch.dir;
+  }
+  let html='';
+  const statusLabel={waiting:'排队',uploading:'上传中',done:'完成',failed:'失败',paused:'暂停',cancelled:'已取消'};
+  for(const t of tasks){
+    const st=t.status;
+    html += `<div class="task"><div class="top">
+      <span class="nm">${esc(t.name)}</span>
+      <span class="st ${st}">${statusLabel[st]||st}</span>
+      ${st==='waiting'||st==='paused'?`<button class="btn danger" style="font-size:11px;padding:2px 8px" onclick="cancelTask('${t.id}')">✕</button>`:''}
+    </div><div class="pbar"><div class="fill" style="width:${t.pct}%"></div></div>
+    <div class="meta"><span>${fmtSize(t.sent)} / ${fmtSize(t.size)}（${t.pct}%）</span>
+    ${t.speed?'<span>'+t.speed.toFixed(1)+' MB/s</span>':''}
+    <span>→ ${esc(t.dest)}</span>${t.tag?`<span>#${esc(t.tag)}</span>`:''}
+    <span>用时 ${t.elapsed}s</span></div>
+    ${t.error?`<div class="err">❌ ${esc(t.error)}</div>`:''}</div>`;
+  }
+  document.getElementById('tasks').innerHTML = html || '<div style="padding:12px;color:var(--sub)">暂无任务</div>';
+}
+setInterval(async()=>{
+  try{const d=await api('/up/api/state');if(!d.error)render(d)}catch(e){}
+},2000);
+loadDests();
+browse();
+</script></body></html>

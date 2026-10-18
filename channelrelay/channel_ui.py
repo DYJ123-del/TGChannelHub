@@ -1364,7 +1364,7 @@ h1{font-size:18px;margin:0 0 4px}
 .pwrow select:focus,.pwrow input:focus{border-color:#5eb5f7}
 #msg{color:#fca5a5;font-size:13px;margin-top:10px;min-height:18px}
 </style></head><body>
-<a class="back" href="/">← 返回</a>
+<a class="back" href="/">← 返回</a>&nbsp;&nbsp;<a class="back" href="/upload" style="color:#86efac">📤 上传中心</a>
 <h1>⚙️ 频道管理</h1>
 <div class="sub">管理代理的频道：添加、删除、复制分享链接、改密码</div>
 <div class="addbox">

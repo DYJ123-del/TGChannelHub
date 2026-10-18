@@ -32,7 +32,8 @@ log = logging.getLogger(__name__)
 
 import os
 try:
-    proxy_cfg = dict(proxy_type='http', addr=os.environ['TG_PROXY_HOST'], port=int(os.environ.get('TG_PROXY_PORT','7890')), rdns=True)
+    proxy_type = os.environ.get('TG_PROXY_TYPE', 'http')  # http 或 socks5
+    proxy_cfg = dict(proxy_type=proxy_type, addr=os.environ['TG_PROXY_HOST'], port=int(os.environ.get('TG_PROXY_PORT','7890')), rdns=True)
     if os.environ.get('TG_PROXY_USER'):
         proxy_cfg['username'] = os.environ['TG_PROXY_USER']
     if os.environ.get('TG_PROXY_PASS'):

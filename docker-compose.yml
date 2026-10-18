@@ -8,6 +8,8 @@ services:
       - "8081:8081"
     volumes:
       - ./data:/app/data
+      # 上传源目录（按需挂载；容器内 /upload = 上传页面浏览白名单根）
+      # - /path/to/your/media:/upload:ro
     environment:
       - TZ=Asia/Shanghai
       # Telegram API 凭证（必填，改你的）
@@ -21,6 +23,8 @@ services:
       - TG_UI_PASSWORD=change-me-share
       - TG_ADMIN_PASSWORD=change-me-admin
       - TG_SESSION_NAME=/app/data/tgchannelhub
+      # 上传功能：可浏览/上传的目录根（容器内挂载点，见 volumes）
+      - UPLOAD_ROOT=/upload
       # 代理（可选；直连 TG 超时/受限才需要，取消注释并填写）
       # - TG_PROXY_HOST=192.168.1.2
       # - TG_PROXY_PORT=7890
