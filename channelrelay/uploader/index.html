@@ -33,6 +33,10 @@ input[type=number]{width:70px}
 .selinfo{font-size:12px;color:var(--sub);margin:8px 0}
 .tasks{max-height:400px;overflow-y:auto}
 .task{background:#0e1621;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px}
+.task.fail{border-color:#5f3a3a;background:rgba(127,29,29,.08)}
+.task.run{border-color:#2b4a6b;background:rgba(37,99,235,.06)}
+.task.run .pbar .fill{animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
 .task .top{display:flex;align-items:center;gap:10px;margin-bottom:6px}
 .task .nm{flex:1;min-width:0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .task .st{font-size:11px;flex-shrink:0;padding:2px 8px;border-radius:999px}
@@ -81,6 +85,7 @@ input[type=number]{width:70px}
     <input type="number" id="concInp" value="3" min="1" max="16" onchange="setConc()">
     <button class="btn gray" id="pauseBtn" onclick="togglePause()">⏸ 暂停</button>
     <button class="btn gray" onclick="clearDone()">🧹 清除已完成</button>
+    <button class="btn danger" onclick="cancelAll()">✖ 取消全部</button>
   </div>
   <div class="statbar" style="margin-top:8px">
     <span>总任务 <b id="stTotal">0</b></span>
@@ -93,15 +98,9 @@ input[type=number]{width:70px}
 </div>
 
 <div class="card">
-  <h2>🚀 实时监控（新文件自动上传）</h2>
-  <div class="row">
-    <input id="watchDir" placeholder="监控目录（UPLOAD_ROOT 内）" style="flex:1;min-width:200px">
-    <button class="btn gray" onclick="setWatchDir()">📂 用当前目录</button>
-    <select id="watchDestSel" style="width:170px"><option value="">目的地…</option></select>
-    <input id="watchTag" placeholder="标签" style="width:100px">
-    <input type="number" id="watchInt" value="30" min="5" style="width:60px" title="扫描间隔秒">
-    <button class="btn green" id="watchBtn" onclick="toggleWatch()">▶ 开启监控</button>
-  </div>
+  <h2>🚀 实时监控（新文件自动上传）<button class="btn green" style="margin-left:8px;padding:4px 12px;font-size:12px" onclick="addWatchRow()">➕ 添加监控目录</button></h2>
+  <div id="watchRows"></div>
+  <div style="font-size:11px;color:var(--sub);margin-top:6px">每行一个监控目录：下拉选择目录（UPLOAD_ROOT 内），新文件自动上传到该行目的地。</div>
 </div>
 
 <div class="card">
@@ -114,7 +113,9 @@ input[type=number]{width:70px}
 let curPath = "/upload";
 let selected = new Map(); // path -> {name,size,dir}
 let paused = false;
-let watchOn = false;
+let dirOptions = [];   // 可监控目录下拉 [{path,label}]
+let destOptions = [];  // 目的地 [{value,name,kind}]
+let watchRows = [];    // [ {wid|null, dir, dest, tag, interval} ] 当前显示的行（未保存的 wid=null）
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmtSize(n){if(!n)return'0B';const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(n>=100||i===0?0:1)+u[i]}
@@ -152,11 +153,12 @@ function updateSelInfo(){
   document.getElementById('selInfo').textContent = n?`已选 ${n} 项，合计 ${fmtSize(s)}（勾选文件夹=递归全部文件）`:'未选择文件';
 }
 async function loadDests(){
-  const d = await api('/up/api/dests');
-  if(!d.ok){msg('加载目的地失败: '+(d.error||''));return}
-  const opts = d.items.map(i=>`<option value="${esc(i.value)}">${esc(i.kind)} · ${esc(i.name)}</option>`).join('');
-  document.getElementById('destSel').innerHTML = '<option value="">选择目的地…（也可手输）</option>' + opts;
-  document.getElementById('watchDestSel').innerHTML = '<option value="">选择目的地…</option>' + opts;
+  const [dd, di] = await Promise.all([api('/up/api/dests'), api('/up/api/dirs')]);
+  if(!dd.ok){msg('加载目的地失败: '+(dd.error||''));return}
+  destOptions = dd.items.map(i=>({value:i.value, name:i.name, kind:i.kind}));
+  document.getElementById('destSel').innerHTML = '<option value="">选择目的地…（也可手输）</option>' + destOptions.map(i=>`<option value="${esc(i.value)}">${esc(i.kind)} · ${esc(i.name)}</option>`).join('');
+  if(di.ok) dirOptions = di.dirs;
+  renderWatchRows();
 }
 async function enqueue(){
   const files=[...selected.keys()], dest=document.getElementById('destSel').value.trim(), tag=document.getElementById('tagInp').value.trim();
@@ -164,11 +166,82 @@ async function enqueue(){
   if(!dest){msg('请选择或输入目的地（@群组 或 chat_id）');return}
   const r = await api('/up/api/enqueue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files,dest,tag})});
   if(r.error){msg(r.error);return}
-  selected.clear();updateSelInfo();msg(`已加入 ${r.added} 个任务`);
+  selected.clear();updateSelInfo();
+  msg(r.skipped?`已加入 ${r.added} 个任务，跳过已上传 ${r.skipped} 个（断点续传）`:`已加入 ${r.added} 个任务`);
 }
-function setWatchDir(){
-  document.getElementById('watchDir').value = curPath;
-  msg('已填入当前目录：'+curPath);
+function watchDirOptionsHTML(sel){
+  const opts = dirOptions.map(d=>`<option value="${esc(d.path)}" ${d.path===sel?'selected':''}>${esc(d.label)}</option>`).join('');
+  return opts;
+}
+function watchDestOptionsHTML(sel){
+  return destOptions.map(d=>`<option value="${esc(d.value)}" ${d.value===sel?'selected':''}>${esc(d.kind)} · ${esc(d.name)}</option>`).join('');
+}
+function addWatchRow(w){
+  w = w || {wid:null, dir:'', dest:'', tag:'', interval:30};
+  watchRows.push(w);
+  renderWatchRows();
+}
+function renderWatchRows(){
+  const box = document.getElementById('watchRows');
+  if(!watchRows.length){
+    box.innerHTML = '<div style="padding:10px;color:var(--sub);font-size:13px">暂无监控目录，点「➕ 添加监控目录」</div>';
+    return;
+  }
+  let html='';
+  watchRows.forEach((w,idx)=>{
+    html += `<div class="watchrow" data-idx="${idx}">
+      <div class="row">
+        <select class="wdir" style="flex:1;min-width:160px" onchange="updWatch(${idx},'dir',this.value)">
+          <option value="">选择目录…</option>${watchDirOptionsHTML(w.dir)}
+        </select>
+        <select class="wdest" style="width:170px" onchange="updWatch(${idx},'dest',this.value)">
+          <option value="">目的地…</option>${watchDestOptionsHTML(w.dest)}
+        </select>
+        <input value="${esc(w.tag||'')}" placeholder="标签" style="width:90px" onchange="updWatch(${idx},'tag',this.value)">
+        <input type="number" value="${w.interval||30}" min="5" style="width:60px" title="间隔秒" onchange="updWatch(${idx},'interval',this.value)">
+        <button class="btn green" style="font-size:12px;padding:6px 12px" onclick="saveWatch(${idx})">✓ 保存</button>
+        <button class="btn danger" style="font-size:12px;padding:6px 10px" onclick="removeWatch(${idx})">🗑</button>
+      </div>
+      <div style="font-size:11px;color:var(--sub);margin-top:4px" id="wstat${idx}"></div>
+    </div>`;
+  });
+  box.innerHTML = html;
+}
+function updWatch(idx,key,val){
+  watchRows[idx][key] = val;
+}
+async function saveWatch(idx){
+  const w = watchRows[idx];
+  if(!w.dir){msg('监控目录不能为空');return}
+  if(!w.dest){msg('目的地不能为空');return}
+  const r = await api('/up/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'add', wid:w.wid||null, dir:w.dir, dest:w.dest, tag:w.tag||'', interval:parseInt(w.interval)||30})});
+  if(r.error){msg(r.error);return}
+  w.wid = r.wid;
+  document.getElementById('wstat'+idx).textContent = '✅ 已保存，等待新文件…';
+  msg('监控已保存');
+}
+async function removeWatch(idx){
+  const w = watchRows[idx];
+  if(w.wid){
+    await api('/up/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'remove', wid:w.wid})});
+  }
+  watchRows.splice(idx,1);
+  renderWatchRows();
+  msg('监控已删除');
+}
+function syncWatchFromServer(serverWatch){
+  // 服务端已有 watcher 但页面没显示（如刷新页面后）→ 补成行
+  const known = watchRows.map(w=>w.wid).filter(Boolean);
+  for(const sw of serverWatch){
+    if(!known.includes(sw.id)){
+      watchRows.push({wid:sw.id, dir:sw.dir, dest:sw.dest, tag:sw.tag||'', interval:sw.interval});
+    }
+  }
+  // 服务端已删除的行（wid 不在 serverWatch）→ 移除页面行
+  const serverIds = serverWatch.map(w=>w.id);
+  watchRows = watchRows.filter(w=>!w.wid || serverIds.includes(w.wid));
 }
 async function setConc(){const v=parseInt(document.getElementById('concInp').value)||3;await api('/up/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({max_concurrent:v})})}
 async function togglePause(){
@@ -177,19 +250,18 @@ async function togglePause(){
   document.getElementById('pauseBtn').textContent = paused?'▶ 继续':'⏸ 暂停';
 }
 async function cancelTask(id){await api('/up/api/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})}
-function clearDone(){}
-async function toggleWatch(){
-  if(watchOn){
-    await api('/up/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:false})});
-    watchOn=false;document.getElementById('watchBtn').textContent='▶ 开启监控';
-  }else{
-    const dir=document.getElementById('watchDir').value.trim(), dest=document.getElementById('watchDestSel').value.trim();
-    const tag=document.getElementById('watchTag').value.trim(), int=parseInt(document.getElementById('watchInt').value)||30;
-    if(!dir||!dest){msg('监控需要目录+目的地');return}
-    const r=await api('/up/api/watch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:true,dir,dest,tag,interval:int})});
-    if(r.error){msg(r.error);return}
-    watchOn=true;document.getElementById('watchBtn').textContent='⏹ 关闭监控';
-  }
+async function cancelAll(){
+  if(!confirm('确定取消全部上传任务？（正在上传的会传完，排队/暂停的全部取消）')) return;
+  const r = await api('/up/api/cancel_all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  msg(r.ok?`已取消 ${r.cancelled} 个任务`:(r.error||'取消失败'));
+}
+async function clearDone(){
+  const r = await api('/up/api/clear_done',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  msg(r.ok?`已清除 ${r.removed} 个已完成任务`:(r.error||'清除失败'));
+}
+async function retryTask(id){
+  const r = await api('/up/api/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  msg(r.ok?'已重新排队':'重试失败: '+(r.error||''));
 }
 function msg(s){document.getElementById('msg').textContent=s}
 function render(data){
@@ -201,24 +273,26 @@ function render(data){
   document.getElementById('stFail').textContent=s.by_status.failed||0;
   document.getElementById('stPause').style.display = s.paused?'inline':'none';
   if(!s.paused && paused){paused=false;document.getElementById('pauseBtn').textContent='⏸ 暂停'}
-  if(s.watch && s.watch.active && !watchOn){
-    watchOn=true;document.getElementById('watchBtn').textContent='⏹ 关闭监控';
-    document.getElementById('watchDir').value = s.watch.dir;
-  }
+  // 同步 watch 行状态（从服务端回读已保存的 watcher）
+  syncWatchFromServer(s.watch||[]);
   let html='';
   const statusLabel={waiting:'排队',uploading:'上传中',done:'完成',failed:'失败',paused:'暂停',cancelled:'已取消'};
   for(const t of tasks){
     const st=t.status;
-    html += `<div class="task"><div class="top">
+    const boxCls = st==='failed' ? 'task fail' : (st==='uploading' ? 'task run' : 'task');
+    const retryHint = (st==='waiting' && t.error) ? `<div class="err">↻ ${esc(t.error)}</div>` : '';
+    const stText = esc(statusLabel[st]||st) + (t.attempt>1?' · '+t.attempt+'次':'');
+    html += `<div class="${boxCls}"><div class="top">
       <span class="nm">${esc(t.name)}</span>
-      <span class="st ${st}">${statusLabel[st]||st}</span>
-      ${st==='waiting'||st==='paused'?`<button class="btn danger" style="font-size:11px;padding:2px 8px" onclick="cancelTask('${t.id}')">✕</button>`:''}
+      <span class="st ${esc(st)}">${stText}</span>
+      ${st==='failed'?`<button class="btn danger" style="font-size:11px;padding:2px 8px" onclick="retryTask('${esc(t.id)}')">↻ 重试</button>`:''}
+      ${st==='waiting'||st==='paused'?`<button class="btn danger" style="font-size:11px;padding:2px 8px" onclick="cancelTask('${esc(t.id)}')">✕</button>`:''}
     </div><div class="pbar"><div class="fill" style="width:${t.pct}%"></div></div>
     <div class="meta"><span>${fmtSize(t.sent)} / ${fmtSize(t.size)}（${t.pct}%）</span>
     ${t.speed?'<span>'+t.speed.toFixed(1)+' MB/s</span>':''}
     <span>→ ${esc(t.dest)}</span>${t.tag?`<span>#${esc(t.tag)}</span>`:''}
     <span>用时 ${t.elapsed}s</span></div>
-    ${t.error?`<div class="err">❌ ${esc(t.error)}</div>`:''}</div>`;
+    ${st==='failed'?`<div class="err">❌ ${esc(t.error||'未知错误')}</div>`:retryHint}</div>`;
   }
   document.getElementById('tasks').innerHTML = html || '<div style="padding:12px;color:var(--sub)">暂无任务</div>';
 }

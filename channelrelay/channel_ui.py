@@ -32,9 +32,12 @@ _channel_list: list = []  # [{"username": ..., "title": ..., "active": bool}]
 _chan_info_cache: dict = {}  # username -> info
 
 
+_channels_loaded = False
+
+
 def _load_channels():
     """读频道列表（首次从 TG_CHANNEL 环境变量初始化）。"""
-    global _channel_list
+    global _channel_list, _channels_loaded
     try:
         import json as _json
         if os.path.exists(CHANNELS_FILE):
@@ -43,6 +46,7 @@ def _load_channels():
     except Exception as e:
         log.warning(f"channels.json load failed: {e}")
         _channel_list = []
+    _channels_loaded = True
     if not _channel_list and tg_channel:
         _channel_list = [{"username": tg_channel, "title": ""}]
         _save_channels()
@@ -50,6 +54,11 @@ def _load_channels():
 
 def _save_channels():
     import json as _json
+    # 防覆盖：写盘前若内存列表还是「从未加载」的空态，先读磁盘（否则重启后
+    # manage_add 会把磁盘上完整列表整体覆盖成只剩刚添加的 1 条——事故根因）
+    global _channels_loaded
+    if not _channels_loaded:
+        _load_channels()
     try:
         with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
             _json.dump(_channel_list, f, ensure_ascii=False, indent=2)
@@ -71,13 +80,20 @@ def _channel_from_req(req) -> str:
 async def _get_peer(username: str = None):
     """按 username 解析并缓存 peer；同时登记 chat_id 反查表。
     收藏夹（is_self User）返回 User 实体，但取消息时须用 InputPeerSelf——调用方用 _msg_entity()。
-    解析失败（频道不存在/无权访问）返回 None，不抛 500。"""
+    解析失败（频道不存在/无权访问）返回 None，不抛 500。
+    纯数字 id（含 -100 前缀）转 int 走实体缓存——字符串会被当用户名解析而失败。"""
     if not username:
         return None
     if username in _peers:
         return _peers[username]
     try:
-        peer = await client.get_entity(username)
+        u = username.strip()
+        if u.startswith("id:"):  # 无 title 频道显示名 "id:123456"
+            u = u[3:].strip()
+        if u.lstrip("-").isdigit():
+            peer = await client.get_entity(int(u))
+        else:
+            peer = await client.get_entity(u)
     except Exception as e:
         log.warning(f"resolve peer failed: {username}: {e}")
         return None
@@ -350,14 +366,19 @@ async def manage_add(req: web.Request) -> web.Response:
     if not _admin_ok(req):
         return web.Response(status=401, text="unauthorized")
     data = await req.post()
+    _load_channels()  # 必须先加载完整列表：重启后内存为空，直接检查/追加会丢历史频道
     username = (data.get("username") or "").strip()
-    # 兼容输入：@xxx / t.me/xxx / https://t.me/xxx
+    # 兼容输入：@xxx / t.me/xxx / https://t.me/xxx / id:123456（无 title 频道显示名）
+    username = username.removeprefix("id:").strip()
     username = username.removeprefix("@").removeprefix("https://t.me/").removeprefix("http://t.me/").removeprefix("t.me/").strip()
     if not username:
         return web.json_response({"ok": False, "msg": "频道不能为空"})
-    # 校验可解析
+    # 校验可解析（数字 id 转 int 走实体缓存，字符串会被当用户名解析而失败）
     try:
-        peer = await client.get_entity(username)
+        if username.lstrip("-").isdigit():
+            peer = await client.get_entity(int(username))
+        else:
+            peer = await client.get_entity(username)
     except Exception as e:
         return web.json_response({"ok": False, "msg": f"无法解析频道: {e}"})
     for c in _channel_list:
@@ -376,6 +397,7 @@ async def manage_del(req: web.Request) -> web.Response:
     if not _admin_ok(req):
         return web.Response(status=401, text="unauthorized")
     data = await req.post()
+    _load_channels()  # 删除前也先加载完整列表（防重启后内存为空误删全部）
     username = (data.get("username") or "").strip()
     _channel_list[:] = [c for c in _channel_list if c["username"] != username]
     _save_channels()
@@ -422,7 +444,7 @@ async def manage_password(req: web.Request) -> web.Response:
 
 @routes.get("/")
 async def index_page(req: web.Request) -> web.Response:
-    # 根路径 = 管理入口：302 到 /manage（管理密码 123321）
+    # 根路径 = 管理入口：302 到 /manage（管理密码保护）
     return web.Response(status=302, headers={"Location": "/manage"})
 
 
@@ -617,6 +639,8 @@ def _item_json(m: Message, peer, username: str = "") -> dict:
     kind = "photo" if tk == "photo" else ("video" if doc is not None else "text")
     caption = (m.message or "").strip()
     q = ("?c=" + username) if username else ""
+    import urllib.parse as _up
+    name_q = _up.quote(name, safe="")  # URL 编码文件名（防 HTML 属性注入/路径字符破坏）
     return {
         "id": m.id,
         "packed": packed,
@@ -628,8 +652,8 @@ def _item_json(m: Message, peer, username: str = "") -> dict:
         "grouped": getattr(m, "grouped_id", None) or 0,
         "date": m.date.strftime("%Y-%m-%d"),
         "thumb": f"/thumb/{packed}{q}",
-        "stream": f"/s/{packed}/{name}{q}",
-        "watch": f"/watch/{packed}/{name}{q}",
+        "stream": f"/s/{packed}/{name_q}{q}",
+        "watch": f"/watch/{packed}/{name_q}{q}",
     }
 
 
@@ -870,7 +894,8 @@ async def watch_page(req: web.Request) -> web.Response:
         player = '<img src="%s" style="width:100%%;border-radius:12px;background:#000" alt="图片">' % thumb_url
     else:
         # 微信 X5 内核：playsinline + x5-video-player-type=h5 让视频在页面内播放（而非全屏/下载）
-        player = ('<video controls preload="metadata" playsinline webkit-playsinline '
+        # 续播：localStorage 记录该视频进度（按 packed id），下次进入自动跳到上次位置
+        player = ('<video id="vmain" controls preload="metadata" playsinline webkit-playsinline '
                   'x5-playsinline x5-video-player-type="h5" src="%s"></video>') % stream
     dl_hint = ""  # 用户要求不提供下载按钮
     name_esc = name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -891,7 +916,43 @@ video{{width:100%;border-radius:12px;background:#000;box-shadow:0 8px 30px rgba(
 <div class="top"><a href="{back_href}">← 返回列表</a></div>
 <div class="vwrap">{player}
 <div class="meta">{name_esc}<br>大小 {_fmt_size(size)}</div>
-{dl_hint}</div></body></html>"""
+{dl_hint}</div>
+<script>
+(function(){{
+  var v=document.getElementById('vmain');
+  if(!v) return;
+  var KEY='tgpos_'+{packed};
+  // 恢复上次进度（仅在播放开始时跳一次；存 ≥5s 避免误记）
+  var saved=0;
+  try{{ saved=parseFloat(localStorage.getItem(KEY))||0; }}catch(e){{}}
+  var jumped=false;
+  v.addEventListener('loadedmetadata',function(){{
+    if(saved>5 && saved<v.duration-5 && !jumped){{
+      jumped=true;
+      try{{ v.currentTime=saved; }}catch(e){{}}
+    }}
+  }});
+  // 定期保存进度（1s 节流）
+  var timer=null;
+  v.addEventListener('timeupdate',function(){{
+    if(!timer){{
+      timer=setTimeout(function(){{
+        timer=null;
+        if(v.currentTime>5){{
+          try{{ localStorage.setItem(KEY, String(v.currentTime)); }}catch(e){{}}
+        }}
+      }},1000);
+    }}
+  }});
+  // 页面关闭前再存一次
+  window.addEventListener('beforeunload',function(){{
+    if(v.currentTime>5){{
+      try{{ localStorage.setItem(KEY, String(v.currentTime)); }}catch(e){{}}
+    }}
+  }});
+}})();
+</script>
+</body></html>"""
     return web.Response(status=200, content_type="text/html", text=html)
 
 
@@ -931,10 +992,10 @@ def render_list_html(msgs_html: str, next_offset: int, peer, chan: dict = None, 
                 .replace("__CHAN_AVATAR_CLOSE__", "</div>" if not show_all else "</a>")
                 .replace("__CHAN_AVATAR__", (chan.get("avatar") or "/avatar").replace("&", "&amp;"))
                 .replace("__CHAN_SWITCH__", switch)
-                .replace("__CHAN__", username.replace("\\", "\\\\").replace('"', '\\"'))
+                .replace("__CHAN__", _js_str(username))
                 .replace("__DISPLAY_SWITCH__", "flex" if (show_all and len(_channel_list) > 1) else "none")
                 .replace("__CHAN_URL__", "/c/%s" % (username or "?"))
-                .replace("__CURTAG__", tag.replace("\\", "\\\\").replace('"', '\\"')))
+                .replace("__CURTAG__", _js_str(tag)))
     return html
 
 
@@ -1154,6 +1215,31 @@ if('IntersectionObserver' in window){
 const iv=setInterval(checkLoad, 1200);
 window.addEventListener('load',checkLoad);
 loadTags();
+// —— 频道浏览位置记忆：localStorage 记录滚动位置 + 已加载的消息 id ——
+(function(){
+  const KEY='tgf_pos_'+CHAN+(CURTAG?'_'+CURTAG:'');
+  // 恢复上次滚动位置（等图片加载后跳一次）
+  let savedY=0;
+  try{ savedY=parseFloat(localStorage.getItem(KEY))||0; }catch(e){}
+  if(savedY>200){
+    window.addEventListener('load',()=>{
+      setTimeout(()=>{ try{ window.scrollTo(0, savedY); }catch(e){} }, 300);
+    });
+  }
+  // 记录滚动位置（500ms 节流）
+  let stimer=null;
+  window.addEventListener('scroll',()=>{
+    if(stimer) return;
+    stimer=setTimeout(()=>{
+      stimer=null;
+      try{ localStorage.setItem(KEY, String(window.scrollY)); }catch(e){}
+    },500);
+  });
+  // 页面关闭前再存一次
+  window.addEventListener('beforeunload',()=>{
+    try{ localStorage.setItem(KEY, String(window.scrollY)); }catch(e){}
+  });
+})();
 </script></body></html>"""
 
 
@@ -1177,6 +1263,18 @@ def _linkify_tags(caption_html: str, chan: str) -> str:
     return _re.sub(r"(?<![&])#([\w\u4e00-\u9fff][\w\u4e00-\u9fff·\-]*)", _rep, caption_html)
 
 
+def _attr_url(url: str) -> str:
+    """URL 用于 HTML 属性时的安全转义（& 和引号）。"""
+    return url.replace("&", "&amp;").replace('"', "&quot;")
+
+
+def _js_str(s: str) -> str:
+    """JS 双引号字符串字面量安全转义：\、"、</script> 序列、换行等全部字节转义。
+    防 ?tag=</script><script>... 反射 XSS（只转义反斜杠和引号不够）。"""
+    return s.replace("\\", "\\\\").replace('"', '\\"') \
+            .replace("</", "<\\/").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
 def _stream_item(it: dict) -> str:
     """TG 消息模式卡片：一条消息 = 媒体（图/视频缩略图）+ 文字 caption + 日期大小。"""
     dur = _fmt_dur(it["duration"])
@@ -1188,7 +1286,7 @@ def _stream_item(it: dict) -> str:
     import urllib.parse as _up
     _chan = _up.parse_qs(_up.urlsplit(it.get("watch", "")).query).get("c", [""])[0]
     caption = _linkify_tags(caption, _chan)
-    watch = it["watch"]
+    watch = _attr_url(it["watch"])  # URL 内 & 引号转义防属性破坏
     kind = it.get("kind", "video")
     if kind == "text":
         return ('<div class="msg">'
@@ -1242,12 +1340,12 @@ def _render_group(grp: dict) -> str:
             tile = ('<a class="at" href="%s" title="查看原图">'
                     '<img loading="lazy" src="%s" alt="图片" '
                     "onerror=\"this.parentElement.style.display='none'\">"
-                    '</a>') % (it["watch"], it["thumb"])
+                    '</a>') % (_attr_url(it["watch"]), it["thumb"])
         elif kind == "video":
             tile = ('<a class="at" href="%s" title="播放视频">'
                     '<img loading="lazy" src="%s" alt="视频" '
                     "onerror=\"this.style.display='none';this.nextElementSibling.style.display='flex'\">"
-                    '<div class="btn-play"></div>%s</a>') % (it["watch"], it["thumb"], dur_badge)
+                    '<div class="btn-play"></div>%s</a>') % (_attr_url(it["watch"]), it["thumb"], dur_badge)
         else:
             tile = ""
         items.append(tile)

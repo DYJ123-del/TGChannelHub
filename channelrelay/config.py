@@ -67,8 +67,9 @@ tg_bot_token = os.environ.get("TG_BOT_FATHER_TOKEN", None)
 tg_channel = os.environ.get("TG_CHANNEL", "").strip() or None
 # 分享密码（访客浏览频道页用）——支持 /app/data/passwords.json 覆盖
 # 管理密码（管理页 /manage 用）——支持 /app/data/passwords.json 覆盖
-ui_password = os.environ.get("TG_UI_PASSWORD", "1234")
-admin_password = os.environ.get("TG_ADMIN_PASSWORD", "123321")
+# ⚠️ 部署后必须通过环境变量 TG_UI_PASSWORD / TG_ADMIN_PASSWORD 设置强密码
+ui_password = os.environ.get("TG_UI_PASSWORD", "change-me-share")
+admin_password = os.environ.get("TG_ADMIN_PASSWORD", "change-me-admin")
 try:
     _pwf = "/app/data/passwords.json"
     if os.path.exists(_pwf):

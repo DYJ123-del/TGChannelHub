@@ -9,7 +9,8 @@ services:
     volumes:
       - ./data:/app/data
       # 上传源目录（按需挂载；容器内 /upload = 上传页面浏览白名单根）
-      # - /path/to/your/media:/upload:ro
+      # 例：把 NAS 整个数据卷挂进去可浏览/上传全部文件
+      # - /vol2/1000:/upload:ro
     environment:
       - TZ=Asia/Shanghai
       # Telegram API 凭证（必填，改你的）

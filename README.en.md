@@ -169,7 +169,7 @@ Turn a Telegram group into a personal cloud drive: upload NAS files straight to 
 
 - **Path**: `/upload` (admin password protected; link on the admin page)
 - **File browser**: browse directories under `UPLOAD_ROOT` (compose volume), multi-select files or whole folders (recursive)
-- **Destination**: dropdown of all your groups/channels (via `get_dialogs`), or type `@username` / chat_id (e.g. the group `5523484915`)
+- **Destination**: dropdown of all your groups/channels (via `get_dialogs`), or type `@username` / chat_id (e.g. your personal drive group ID)
 - **Queue**: adjustable concurrency (1–16 files at once), pause/resume, cancel single queued tasks
 - **Parallel speed-up**: files >10MB upload as 512KB chunks × 8 concurrent (`SaveBigFilePart` + `InputFileBig`) — ~4× faster than serial upload
 - **Live progress**: progress bar, % / MB/s / elapsed, refreshed every 2s
