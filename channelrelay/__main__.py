@@ -23,14 +23,29 @@ from .telegram import client, transfer
 from .channel_ui import routes as ui_routes
 from .uploader.routes import routes as uploader_routes
 from .uploader import UploadEngine
+from .setup_ui import _authorized, routes as setup_routes
 from .config import host, port, public_url, tg_bot_token
 from .log import log
 
-server = web.Application()
+# 未登录重定向 middleware：Telegram session 未认证时，除 /setup 外全部访问 302 到引导页
+@web.middleware
+async def _setup_middleware(req: web.Request, handler):
+    path = req.path
+    if path.startswith("/setup"):
+        return await handler(req)
+    if path in ("/favicon.ico", "/robots.txt"):
+        return await handler(req)
+    if not await _authorized():
+        # 防中间代理缓存 302 重定向（客户端会一直卡在 /setup）
+        return web.Response(status=302, headers={"Location": "/setup", "Cache-Control": "no-store"})
+    return await handler(req)
+
+server = web.Application(middlewares=[_setup_middleware])
 # 原版无鉴权路由（/{id}/{name} 直链流）已弃用——存在未授权访问与 Content-Range off-by-one 问题，
 # 全部播放/下载走 channel_ui（/s/ 等，带分享密码鉴权）。不注册原版 routes。
 server.add_routes(ui_routes)
 server.add_routes(uploader_routes)
+server.add_routes(setup_routes)
 
 # 上传引擎单例（注入主 client，启动时开始 worker；watch 由页面 API 控制）
 upload_engine: UploadEngine = None
@@ -40,7 +55,18 @@ loop = asyncio.get_event_loop()
 
 
 async def start() -> None:
-    await client.start(bot_token=tg_bot_token)
+    # 登录容错：已登录/配了 bot token 则正常 start；未登录且无 bot token 时，
+    # Telethon 默认走 input() 交互（Docker 无 TTY 会 EOFError 崩溃）——捕获后
+    # 仅保持连接，登录完全交给 /setup 引导页或 scripts/login.py。
+    try:
+        await client.start(bot_token=tg_bot_token)
+    except Exception as e:
+        log.warning(f"client.start() skipped (not logged in): {e} — 用 /setup 或 scripts/login.py 登录")
+    if not client.is_connected():
+        try:
+            await client.connect()
+        except Exception as e:
+            log.error(f"Telegram connect failed: {e}")
 
     config = await client(functions.help.GetConfigRequest())
     for option in config.dc_options:
