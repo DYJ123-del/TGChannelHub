@@ -77,6 +77,73 @@ def _channel_from_req(req) -> str:
     return req.query.get("c", "").strip()
 
 
+# ── 广告过滤 ───────────────────────────────────────────────
+# 命中关键词/链接黑名单的消息整条隐藏（含其媒体）。词表持久化在
+# /app/data/ad_filter.json，管理页可编辑；文件缺失时用内置默认词表。
+AD_FILTER_FILE = "/app/data/ad_filter.json"
+AD_FILTER_TTL = 30  # 秒级检测，自动热加载管理页改动
+
+# 内置默认词表（基于 2026-10 实测：极搜JISOU跨频道推广、内群/赞助群引流、博彩推广）
+DEFAULT_AD_KEYWORDS = [
+    "内群", "赞助群", "防丢失", "通知群",
+    "极搜", "JISOU", "鲍鱼盒子",
+    "澳门博彩", "PG电子", "开户网址", "巨额奖金", "巨额担保", "500万",
+    "一次付费", "打包优惠", "全网最全",
+]
+DEFAULT_AD_LINKS = ["t.me/jisou2"]
+
+_ad_state = {
+    "enabled": True,
+    "keywords": list(DEFAULT_AD_KEYWORDS),
+    "link_blacklist": list(DEFAULT_AD_LINKS),
+    "ts": 0.0,
+}
+
+
+def _load_ad_filter(force: bool = False):
+    """秒级 TTL 热加载 ad_filter.json；文件缺失/损坏时保留当前词表。加载即转小写（匹配用）。"""
+    global _ad_state
+    now = time.time()
+    if not force and now - _ad_state["ts"] < AD_FILTER_TTL:
+        return
+    try:
+        if os.path.exists(AD_FILTER_FILE):
+            import json as _json
+            with open(AD_FILTER_FILE, "r", encoding="utf-8") as f:
+                d = _json.load(f)
+            if not isinstance(d, dict):
+                raise ValueError("ad_filter.json 顶层须为对象")
+            _ad_state["enabled"] = bool(d.get("enabled", True))
+            _ad_state["keywords"] = [k.strip().lower() for k in (d.get("keywords") or []) if isinstance(k, str) and k.strip()]
+            _ad_state["link_blacklist"] = [k.strip().lower() for k in (d.get("link_blacklist") or []) if isinstance(k, str) and k.strip()]
+    except Exception as e:
+        log.warning(f"ad_filter load failed: {e}")
+    _ad_state["ts"] = now
+
+
+def _is_ad(m) -> bool:
+    """消息是否为广告：caption 命中任一关键词或链接黑名单（大小写不敏感）。
+    无文字（纯媒体）消息一律视为正常内容，不过滤。
+    先热加载再查 enabled：文件状态可能被带外修改（直接改文件/多实例共享卷），
+    先 load 保证 30s 内收敛到文件状态，避免「应停用未停用/应启用未启用」窗口。"""
+    _load_ad_filter()
+    if not _ad_state.get("enabled"):
+        return False
+    cap = getattr(m, "message") or ""
+    if not cap:
+        return False
+    low = cap.lower()
+    for kw in _ad_state["keywords"]:
+        if kw and kw in low:
+            log.debug("ad filtered (keyword %r) msg=%s", kw, getattr(m, "id", None))
+            return True
+    for lb in _ad_state["link_blacklist"]:
+        if lb and lb in low:
+            log.debug("ad filtered (link %r) msg=%s", lb, getattr(m, "id", None))
+            return True
+    return False
+
+
 async def _get_peer(username: str = None):
     """按 username 解析并缓存 peer；同时登记 chat_id 反查表。
     收藏夹（is_self User）返回 User 实体，但取消息时须用 InputPeerSelf——调用方用 _msg_entity()。
@@ -442,6 +509,134 @@ async def manage_password(req: web.Request) -> web.Response:
     return web.json_response({"ok": True, "msg": "密码已更新，下次生效"})
 
 
+@routes.get("/manage/api/adfilter")
+async def manage_adfilter_get(req: web.Request) -> web.Response:
+    """读取当前广告过滤配置（强制重读文件，反映管理页改动）。"""
+    if not _admin_ok(req):
+        return web.Response(status=401, text="unauthorized")
+    _load_ad_filter(force=True)
+    return web.json_response({
+        "ok": True,
+        "enabled": _ad_state["enabled"],
+        "keywords": _ad_state["keywords"],
+        "link_blacklist": _ad_state["link_blacklist"],
+    })
+
+
+@routes.post("/manage/api/adfilter")
+async def manage_adfilter_save(req: web.Request) -> web.Response:
+    """保存广告过滤配置（JSON：{enabled, keywords:[], link_blacklist:[]}），写盘并立即生效。"""
+    if not _admin_ok(req):
+        return web.Response(status=401, text="unauthorized")
+    try:
+        data = await req.json()
+    except Exception:
+        return web.json_response({"ok": False, "msg": "JSON 解析失败"})
+    if not isinstance(data, dict):
+        return web.json_response({"ok": False, "msg": "请求体须为 JSON 对象"})
+    enabled = bool(data.get("enabled", True))
+    kw_raw = data.get("keywords") or []
+    lb_raw = data.get("link_blacklist") or []
+    # 类型校验：须为数组（防字符串被逐字符拆开存成 ['a','b','c']）
+    if not isinstance(kw_raw, list) or not isinstance(lb_raw, list):
+        return web.json_response({"ok": False, "msg": "keywords / link_blacklist 须为字符串数组"})
+    keywords = [k.strip().lower() for k in kw_raw if isinstance(k, str) and k.strip()]
+    link_blacklist = [k.strip().lower() for k in lb_raw if isinstance(k, str) and k.strip()]
+    # 条目上限防滥用
+    if len(keywords) > 500 or len(link_blacklist) > 200:
+        return web.json_response({"ok": False, "msg": "条目过多（关键词≤500 / 链接≤200）"})
+    cfg = {"enabled": enabled, "keywords": keywords, "link_blacklist": link_blacklist}
+    try:
+        import json as _json
+        import tempfile
+        d = os.path.dirname(AD_FILTER_FILE)
+        os.makedirs(d, exist_ok=True)
+        # 原子写：先写同目录临时文件再 os.replace 换名（中途崩溃不留半个 JSON，
+        # 避免 _load_ad_filter 读坏文件；旧文件在成功换名前始终完好）
+        fd, tmp = tempfile.mkstemp(prefix=".adfilter_", suffix=".tmp", dir=d)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            _json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, AD_FILTER_FILE)
+    except Exception as e:
+        return web.json_response({"ok": False, "msg": f"保存失败: {e}"})
+    _load_ad_filter(force=True)  # 立即生效，不用等 TTL
+    return web.json_response({
+        "ok": True,
+        "msg": f"已保存（{len(keywords)} 关键词 / {len(link_blacklist)} 链接，{'启用' if enabled else '停用'}）",
+    })
+
+
+@routes.get("/adfilter")
+async def adfilter_page(req: web.Request) -> web.Response:
+    """独立广告过滤配置页（管理密码保护，类似 /upload 入口）。"""
+    if not _admin_ok(req):
+        return web.Response(status=200, content_type="text/html", text=ADMIN_LOGIN_HTML)
+    return web.Response(status=200, content_type="text/html", text=AD_FILTER_HTML)
+
+
+AD_FILTER_HTML = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>广告过滤</title>
+<style>
+:root{--bg:#0e1621;--card:#17212b;--line:#1f2c38;--txt:#e1e3e6;--sub:#708499;--acc:#c084fc;--ok:#86efac;--err:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;max-width:760px;margin:0 auto;padding:24px 16px}
+.back{color:#5eb5f7;font-size:13px;text-decoration:none;display:inline-block;margin-bottom:16px}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:var(--sub);font-size:13px;margin-bottom:20px}
+.box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:16px}
+.title{font-size:14px;font-weight:600;display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.title label{margin-left:auto;font-size:12px;color:var(--sub);cursor:pointer}
+.title input{accent-color:var(--acc)}
+.desc{font-size:12px;color:var(--sub);margin:10px 0 6px;line-height:1.6}
+textarea{width:100%;background:#0e1621;border:1px solid #2a3a49;border-radius:8px;color:var(--txt);padding:10px;font-size:13px;resize:vertical;font-family:inherit;line-height:1.8}
+textarea:focus{border-color:var(--acc);outline:none}
+.btn{margin-top:14px;background:var(--acc);border:none;border-radius:8px;color:#0e1621;font-size:14px;font-weight:600;padding:10px 20px;cursor:pointer}
+.btn:hover{filter:brightness(1.1)}
+#msg{color:var(--ok);font-size:13px;margin-top:12px;min-height:18px}
+#msg.err{color:var(--err)}
+.hint{font-size:12px;color:var(--sub);margin-top:12px;line-height:1.7;border-top:1px solid var(--line);padding-top:10px}
+</style></head><body>
+<a class="back" href="/manage">← 返回频道管理</a>
+<h1>🛡 广告过滤</h1>
+<div class="sub">命中关键词/链接黑名单的消息将从频道列表隐藏（含其媒体）</div>
+<div class="box">
+  <div class="title">广告过滤开关
+    <label><input type="checkbox" id="adEnabled" checked> 启用</label>
+  </div>
+  <div class="desc">关键词（每行一个，不区分大小写；正常番號/片名不含这些词，误杀风险低）</div>
+  <textarea id="adKeywords" rows="8" placeholder="内群&#10;极搜&#10;JISOU"></textarea>
+  <div class="desc">链接黑名单（caption 含这些链接则过滤，每行一个）</div>
+  <textarea id="adLinks" rows="3" placeholder="t.me/jisou2"></textarea>
+  <button class="btn" id="saveBtn" onclick="saveAdFilter()">保存</button>
+  <div id="msg"></div>
+  <div class="hint">💡 保存后 30 秒内自动热生效（无需重启）。发现误杀正常内容：删掉对应关键词即可；发现漏过滤：补充关键词或链接黑名单。</div>
+</div>
+<script>
+function setMsg(m, ok){const el=document.getElementById('msg');el.textContent=m;el.className=ok?'':'err';}
+async function loadAdFilter(){
+  try{
+    const r=await fetch('/manage/api/adfilter'); const d=await r.json();
+    if(!d.ok) return;
+    document.getElementById('adEnabled').checked=!!d.enabled;
+    document.getElementById('adKeywords').value=(d.keywords||[]).join('\\n');
+    document.getElementById('adLinks').value=(d.link_blacklist||[]).join('\\n');
+  }catch(e){}
+}
+async function saveAdFilter(){
+  const enabled=document.getElementById('adEnabled').checked;
+  const keywords=document.getElementById('adKeywords').value.split('\\n').map(s=>s.trim()).filter(Boolean);
+  const link_blacklist=document.getElementById('adLinks').value.split('\\n').map(s=>s.trim()).filter(Boolean);
+  const r=await fetch('/manage/api/adfilter',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled,keywords,link_blacklist})});
+  const d=await r.json();
+  setMsg(d.msg||'已保存', d.ok);
+  if(d.ok) loadAdFilter();
+}
+loadAdFilter();
+</script></body></html>"""
+
+
 @routes.get("/")
 async def index_page(req: web.Request) -> web.Response:
     # 根路径 = 管理入口：302 到 /manage（管理密码保护）
@@ -659,33 +854,38 @@ def _item_json(m: Message, peer, username: str = "") -> dict:
 
 def _collect_items(msgs: list, peer, username: str = "") -> tuple:
     """把消息列表聚合成渲染项：同一 grouped_id 的连续消息合并为一个 album 组。
-    返回 (items, next_offset)。next_offset = 最后一条参与渲染的消息 id。"""
+    命中广告过滤（_is_ad）的消息整条跳过（含其媒体）；相册组内命中广告的成员跳过但组保持完整。
+    返回 (items, next_offset)。next_offset 始终推进到本页最后一条被扫描的消息 id
+    （含被跳过的广告/无内容消息）——与是否渲染解耦：整页全广告时也能继续向旧翻页，
+    消除 /more「到底了」死路。"""
     items = []
     next_offset = 0
     i = 0
     n = len(msgs)
     while i < n:
         m = msgs[i]
-        if not _has_content(m):
+        next_offset = m.id  # 扫描到即推进（无论渲染与否）
+        if not _has_content(m) or _is_ad(m):
             i += 1
             continue
-        next_offset = m.id
         gid = getattr(m, "grouped_id", None) or 0
         if not gid:
             items.append(_item_json(m, peer, username))
             i += 1
             continue
-        # 同组：向更旧方向收集同 grouped_id 的媒体消息
+        # 同组：向更旧方向收集同 grouped_id 的媒体消息；广告成员跳过但组不断
         group = [_item_json(m, peer, username)]
         j = i + 1
         while j < n:
             m2 = msgs[j]
-            if (getattr(m2, "grouped_id", None) or 0) == gid and _has_content(m2):
-                group.append(_item_json(m2, peer, username))
-                next_offset = m2.id
-                j += 1
-            else:
+            if (getattr(m2, "grouped_id", None) or 0) != gid or not _has_content(m2):
                 break
+            next_offset = m2.id  # 组内成员扫描到即推进
+            if _is_ad(m2):
+                j += 1
+                continue
+            group.append(_item_json(m2, peer, username))
+            j += 1
         # 组内按 id 升序（第一张 = 最新 id，与 TG 顺序一致：id 大 = 后发 = 在组内靠后位置）
         # TG 相册内 id 小的先发 → 排在左边/前面；这里保持消息列表顺序（id 降序）即第一张为 id 最大
         if len(group) > 1:
@@ -1462,7 +1662,7 @@ h1{font-size:18px;margin:0 0 4px}
 .pwrow select:focus,.pwrow input:focus{border-color:#5eb5f7}
 #msg{color:#fca5a5;font-size:13px;margin-top:10px;min-height:18px}
 </style></head><body>
-<a class="back" href="/">← 返回</a>&nbsp;&nbsp;<a class="back" href="/upload" style="color:#86efac">📤 上传中心</a>
+<a class="back" href="/">← 返回</a>&nbsp;&nbsp;<a class="back" href="/upload" style="color:#86efac">📤 上传中心</a>&nbsp;&nbsp;<a class="back" href="/adfilter" style="color:#c084fc">🛡 广告过滤</a>
 <h1>⚙️ 频道管理</h1>
 <div class="sub">管理代理的频道：添加、删除、复制分享链接、改密码</div>
 <div class="addbox">
