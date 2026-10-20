@@ -20,6 +20,9 @@ A deep fork of [tgfilestream](https://mau.dev/tulir/tgfilestream) (AGPL-3.0, Tul
 | 🚀 Concurrent acceleration | Multi-thread chunked download + DC connection warmup for fast start |
 | 🏷️ Hashtag browsing | Tag bar + full tag cloud + clickable `#tag` in captions, filter by series |
 | 🖼️ Image lightbox | Click any photo to open a fullscreen viewer, swipe/arrow to browse prev/next |
+| 🛡 Ad filtering | Keyword + link blacklist; matched messages hidden entirely (media included), hot-configured from the admin page |
+| 📤 Upload center | Use a TG group as a personal cloud drive: pick files/folders in the web UI and upload (parallel speed-up, resume, watch mode) |
+| 🚪 Setup wizard | When not logged in, a web page guides you through phone → code → 2FA — no shell needed |
 
 ## 🚀 Quick Start (Docker recommended)
 
@@ -85,13 +88,17 @@ services:
 
 ```bash
 docker compose up -d --build
-
-# First-time Telegram login (account that owns the channels/favorites)
-docker exec -it tgchannelhub python3 scripts/login.py send <your-phone-number>
-docker exec -it tgchannelhub python3 scripts/login.py sign <received-code>
-# If 2FA is enabled on the account:
-docker exec -it tgchannelhub python3 scripts/login.py password <2FA-password>
 ```
+
+Open the site in a browser. When not logged in, every request is redirected to the **`/setup` wizard**: enter your phone number → the code you receive → (if 2FA is enabled) the 2FA password. Everything happens in the web page.
+
+> The CLI flow still works as an alternative (same result):
+> ```bash
+> docker exec -it tgchannelhub python3 scripts/login.py send <your-phone-number>
+> docker exec -it tgchannelhub python3 scripts/login.py sign <received-code>
+> # If 2FA is enabled on the account:
+> docker exec -it tgchannelhub python3 scripts/login.py password <2FA-password>
+> ```
 
 After login, refresh the web page. The session file is stored in `data/` and survives restarts.
 
@@ -118,6 +125,8 @@ Backup: `tar czf tgchannelhub-data.tar.gz data/`; to migrate, extract into the `
 | `/c` | Channel picker (shows all when multiple channels) | Share |
 | `/c/<channel>` | Single-channel locked view (only that channel) | Share |
 | `/watch/<id>/<name>` | Video/photo player page | Share |
+| `/upload` | Upload center (send files to your TG groups/channels) | Admin |
+| `/adfilter` | Ad-filter config (keywords / link blacklist) | Admin |
 
 **Typical usage**: you manage via `/manage`; share the `/c/<channel>` link with visitors — they enter the share password to watch.
 
@@ -176,6 +185,16 @@ Turn a Telegram group into a personal cloud drive: upload NAS files straight to 
 - **Watch mode**: monitor a directory; new files auto-enqueue (mtime-stable check, auto `#tag` by parent dir name)
 - Proxy/credentials are injected via compose env vars (`TG_PROXY_TYPE` supports `http`/`socks5`); the upload engine reuses the main client — no separate login, no session conflicts.
 
+## 🛡 Ad filtering
+
+Promotional messages mixed into channels (spam invites, gambling ads, …) can be hidden entirely (media included) by **keywords + link blacklist**.
+
+- **Path**: admin page 「🛡 广告过滤」→ `/adfilter` (admin password protected)
+- **Keywords**: a message caption matching any keyword is hidden; case-insensitive; ships with a default list learned from real channels (JISOU, invite-group, gambling, …)
+- **Link blacklist**: captions containing a listed link (e.g. `t.me/xxx`) are hidden
+- **Hot reload**: takes effect within ~30s of saving, no restart; the list lives in `data/ad_filter.json`, editable back anytime
+- **Pure media messages** (no text caption) are never filtered
+
 ## 🛠 Development / Local run
 
 ```bash
@@ -187,12 +206,13 @@ Project layout:
 
 ```
 ├── channelrelay/
-│   ├── channel_ui.py        # All Web UI routes (list/play/manage/auth/tags)
+│   ├── channel_ui.py        # All Web UI routes (list/play/manage/auth/tags/ad-filter)
+│   ├── setup_ui.py          # Setup wizard (/setup: phone → code → 2FA)
 │   ├── telegram.py          # Telegram client + proxy injection
 │   ├── paralleltransfer.py  # Concurrent chunked downloader (Telethon-compatible patch)
 │   ├── config.py            # Environment variable config
 │   ├── util.py              # packed id encode/decode / file names
-│   └── __main__.py          # Entry point
+│   └── __main__.py          # Entry point (incl. not-logged-in redirect middleware)
 ├── scripts/login.py         # First-login helper (send/sign/password/verify)
 └── docker-compose.yml       # Ready-to-use deployment template
 ```

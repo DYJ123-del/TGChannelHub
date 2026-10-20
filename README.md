@@ -18,6 +18,11 @@
 | 📱 微信/手机可直接播 | 针对微信 X5 内核优化（playsinline、正确 Range） |
 | 🔒 双密码体系 | 分享密码（访客）+ 管理密码（管理员）分开 |
 | 🚀 并发加速 | 多线程分块下载 + DC 连接预热，启动快 |
+| 🏷️ 标签浏览 | 高频 #标签栏 + 全量标签云 + caption 内 #标签可点，按系列筛选 |
+| 🖼️ 图片灯箱 | 点击图片全屏查看，触摸/箭头/键盘滑动切换上/下一张 |
+| 🛡 广告过滤 | 关键词 + 链接黑名单，命中消息整条隐藏（含媒体），管理页热配置 |
+| 📤 上传中心 | 把 TG 群组当个人网盘：网页选文件/目录上传（并行加速、断点、监控） |
+| 🚪 登录引导页 | 未登录时网页内引导填手机号/验证码/2FA，无需进容器敲命令 |
 
 ## 🚀 快速开始（推荐 Docker）
 
@@ -83,13 +88,17 @@ services:
 
 ```bash
 docker compose up -d --build
-
-# 首次需登录 Telegram 账号（频道/收藏夹所属账号）
-docker exec -it tgchannelhub python3 scripts/login.py send <你的手机号>
-docker exec -it tgchannelhub python3 scripts/login.py sign <收到的验证码>
-# 如果账号开了两步验证：
-docker exec -it tgchannelhub python3 scripts/login.py password <2FA密码>
 ```
+
+启动后浏览器打开站点，**未登录时会自动跳到 `/setup` 登录引导页**：按步骤填手机号 → 收到的验证码 → （如开启两步验证）2FA 密码，登录完成自动放行，全程在网页内完成。
+
+> 也可以继续用命令行登录（效果相同，二选一）：
+> ```bash
+> docker exec -it tgchannelhub python3 scripts/login.py send <你的手机号>
+> docker exec -it tgchannelhub python3 scripts/login.py sign <收到的验证码>
+> # 如果账号开了两步验证：
+> docker exec -it tgchannelhub python3 scripts/login.py password <2FA密码>
+> ```
 
 登录完成后刷新网页即可。session 文件保存在 `data/` 目录，重启不丢。
 
@@ -116,6 +125,8 @@ docker exec -it tgchannelhub python3 scripts/login.py password <2FA密码>
 | `/c` | 频道选择页（多频道时展示所有） | 分享密码 |
 | `/c/<频道>` | 单频道锁定页（只可看该频道） | 分享密码 |
 | `/watch/<id>/<name>` | 视频/图片播放页 | 分享密码 |
+| `/upload` | 上传中心（把文件传到你的 TG 群组/频道） | 管理密码 |
+| `/adfilter` | 广告过滤配置（关键词 / 链接黑名单） | 管理密码 |
 
 **典型用法**：你自己用 `/manage` 管理；把 `/c/<频道>` 链接分享给别人，他们输分享密码即可看。
 
@@ -159,6 +170,16 @@ environment:
 - **目录监控**：指定目录后新文件自动入队（mtime 稳定判定、按父目录自动打 `#标签`）
 - 代理/凭据全部由 compose 环境变量注入；上传引擎复用主 client（不重新登录、无 session 冲突）
 
+## 🛡 广告过滤
+
+频道里混入的推广消息（引流广告、博彩推广等）可以按**关键词 + 链接黑名单**整条隐藏（含媒体）。
+
+- **入口**：管理页「🛡 广告过滤」→ `/adfilter`（管理密码保护）
+- **关键词**：caption 命中任一关键词即隐藏，不区分大小写；默认带一组实测词表（极搜/JISOU、内群/赞助群、博彩等）
+- **链接黑名单**：caption 里含指定链接（如 `t.me/xxx`）即隐藏
+- **热生效**：保存后 30 秒内自动生效，无需重启；词表存在 `data/ad_filter.json`，可随时改回
+- **纯媒体消息**（无文字 caption）一律视为正常内容，不过滤
+
 ## 🛠 开发 / 本地运行
 
 ```bash
@@ -170,12 +191,13 @@ python3 -m channelrelay
 
 ```
 ├── channelrelay/
-│   ├── channel_ui.py        # Web UI 全部路由（列表/播放/管理/认证）
+│   ├── channel_ui.py        # Web UI 全部路由（列表/播放/管理/认证/广告过滤）
+│   ├── setup_ui.py          # 登录引导页（/setup：手机号→验证码→2FA）
 │   ├── telegram.py          # Telegram 客户端 + 代理注入
 │   ├── paralleltransfer.py  # 并发分块下载器（Telethon 兼容补丁）
 │   ├── config.py            # 环境变量配置
 │   ├── util.py              # packed id 编解码 / 文件名
-│   └── __main__.py          # 启动入口
+│   └── __main__.py          # 启动入口（含未登录重定向 middleware）
 ├── scripts/login.py         # 首次登录辅助（send/sign/password/verify）
 └── docker-compose.yml       # 开箱即用的部署模板
 ```
