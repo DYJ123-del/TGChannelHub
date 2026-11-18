@@ -20,7 +20,6 @@ import logging
 import asyncio
 import math
 import os
-import random
 import re
 import time
 from collections import OrderedDict
@@ -48,10 +47,8 @@ root_log = logging.getLogger(__name__)
 # `discardResponse = true` + 把该请求的 minStartTime 推到 now+wait，即「重新排队等 N 秒」，
 # **上层永远看不到失败** —— 所以客户端只会变慢、不会播放失败。
 # 我们照此实现：限流不算失败、不计入重试预算、永不因限流中断流；只按 DC 隔离地推迟发送。
-_flood_gates: Dict[int, float] = {}   # dc_id -> 最早可发送时刻（monotonic）
-# 账号级闸门：TG 的 flood 是账号级的，某个 DC 被限流后别的 DC 继续发只会各自再吃一次 420，
-# 等价于「用更多请求换更长的惩罚」。所以任意 DC 收到限流都同步推后账号闸门。
-_account_gate = [0.0]  # 用列表包一层避免 nonlocal/global 到处声明
+# 限流处理：收到 FloodPremiumWait 就按服务端给的秒数等待后重发同一分块，
+# 不计入重试预算、不中断流（参考官方 tgnet：限流表现为变慢，不是播放失败）。
 
 
 class _FileMigrated(Exception):
@@ -103,9 +100,7 @@ async def _drop_tasks(pending: Dict[int, asyncio.Task]) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-FLOOD_MAX_WAIT = _env_num("TG_FLOOD_MAX_WAIT", 60.0)           # 单次闸门延长上限（秒）
-FLOOD_PART_WAIT_TOTAL = _env_num("TG_FLOOD_PART_TOTAL", 90.0)  # 单个分块总等待预算（秒，防无限饥饿）
-FLOOD_RELEASE_JITTER = _env_num("TG_FLOOD_JITTER", 1.5)        # 闸门放行后的随机抖动（秒，防惊群）
+FLOOD_MAX_WAIT = _env_num("TG_FLOOD_MAX_WAIT", 60.0)           # 单次限流最长等待（秒）
 
 # 内存分块缓存（LRU，不落盘）：播放器重试/回拖/多设备看同一段时不再重复打 TG，
 # 直接减少请求量 → 少撞 FloodPremiumWait。key=(packed消息id, 分块大小, 分块序号)。
@@ -297,16 +292,10 @@ class ParallelTransferrer:
         self._counter += 1
         return self._counter
 
-    # 并发在途分块数（NagramX/官方客户端提速同理：同时拉多个 part 减少 RTT 暴露）
-    # 可用 TG_PARALLEL_CONCURRENCY 调（默认 6，上限 32）：TG 下载吞吐受 RTT×在途窗口限制，
-    # 窗口 = CONCURRENCY × 512KB。实测 6→1.2MB/s，调大后需观察是否触发 FloodWait。
-    CONCURRENCY = max(1, min(32, _env_num("TG_PARALLEL_CONCURRENCY", 6, int)))
-    # 单个分块的超时与重试：TG 偶发 FloodWait / 连接卡死时，如果不重试，
-    # 旧代码会静默结束生成器 → HTTP 声明 32MB 却只给 10MB → 播放器永久卡住。
-    PART_TIMEOUT = _env_num("TG_PART_TIMEOUT", 20.0)
-    PART_RETRIES = max(1, _env_num("TG_PART_RETRIES", 3, int))
-    # 慢启动起始窗口：开播时只放这么多路请求，成功一块再 +1（防突发撞限流）
-    START_WINDOW = max(1, _env_num("TG_START_WINDOW", 2, int))
+    # 并发在途分块数（这就是「多线程加速」的全部：512KB × N 并发拉）
+    CONCURRENCY = max(1, min(32, _env_num("TG_PARALLEL_CONCURRENCY", 8, int)))
+    # 偶发 RPC 异常的重试次数（限流另算，不占这个预算）
+    PART_RETRIES = max(1, _env_num("TG_PART_RETRIES", 2, int))
 
     async def _fetch_part(self, conn, location, part: int, part_size: int, log, dc_id: int,
                           cache_key=None) -> bytes:
@@ -319,7 +308,6 @@ class ParallelTransferrer:
         """
         last_err: Optional[BaseException] = None
         attempt = 0
-        flood_waited = 0.0
         ck = (cache_key, part_size, part) if cache_key is not None else None
         if ck is not None:
             hit = _cache_get(ck)
@@ -327,42 +315,15 @@ class ParallelTransferrer:
                 log.debug(f"Part {part} 命中内存缓存")
                 return hit
         while True:
-            # 闸门：DC 级 + 账号级取较晚的那个（TG 的 flood 是账号级的，DC 级只是细分）
-            waited_for_flood = False
-            while True:
-                until = max(_flood_gates.get(dc_id, 0.0), _account_gate[0])
-                delay = until - time.monotonic()
-                if delay <= 0:
-                    break
-                waited_for_flood = True
-                slept = min(delay, 5)
-                await asyncio.sleep(slept)
-                flood_waited += slept
-                if flood_waited > FLOOD_PART_WAIT_TOTAL:
-                    # 有界等待：永久限流的账号不能把一条 206 挂死在 sleep 上（连接/分块会一直占着）
-                    raise RuntimeError(
-                        f"part {part} 限流累计等待超过 {FLOOD_PART_WAIT_TOTAL:.0f}s，终止该流让播放器重连")
-            # 抖动只在「真的刚等过限流」之后加，避免给正常请求平白加延迟
-            if waited_for_flood and FLOOD_RELEASE_JITTER > 0:
-                await asyncio.sleep(random.uniform(0, FLOOD_RELEASE_JITTER))
             req = GetFileRequest(location, offset=part * part_size, limit=part_size)
             try:
-                res = await asyncio.wait_for(conn.sender.send(req), timeout=self.PART_TIMEOUT)
+                # 不加 per-part 超时：限流态下单块 512KB 可能要 15~20s，
+                # 超时会触发重试/换连接风暴，越重试越慢（原始版本就是无限等）。
+                res = await conn.sender.send(req)
                 if ck is not None:
                     _cache_put(ck, res.bytes)
                 conn.fails = 0
                 return res.bytes
-            except asyncio.TimeoutError as e:
-                last_err = e
-                attempt += 1
-                # 连续超时说明这条连接已经坏了，标记失效 → 换连接继续（不要在这条死连接上重试满预算）
-                conn.fails += 1
-                if conn.fails >= 2:
-                    conn.dead = True
-                    log.warning(f"Part {part} 连续超时 {conn.fails} 次，连接标记失效，换连接续传")
-                    raise _ConnDead() from e
-                log.warning(f"Part {part} 分块超时 {self.PART_TIMEOUT:.0f}s "
-                            f"(attempt {attempt}/{self.PART_RETRIES}, 连接连续失败 {conn.fails})")
             except Exception as e:  # FloodPremiumWaitError / RPC error / 连接被重置 / 迁移
                 msg_text = getattr(e, "message", "") or ""
                 # ⓪ 连接已断（telethon 在断连时同步抛 ConnectionError）：换连接，不烧重试预算
@@ -396,13 +357,11 @@ class ParallelTransferrer:
                     if mf:
                         wait = int(mf.group(1))
                 if wait:
-                    # 限流：只推闸门、不计入 attempt、永不失败（tgnet 语义）
+                    # 限流：睡够服务端要求的秒数后重发同一分块，不计 attempt、不中断流
                     last_err = e
                     capped = min(float(wait), FLOOD_MAX_WAIT)
-                    until = time.monotonic() + capped
-                    _flood_gates[dc_id] = max(_flood_gates.get(dc_id, 0.0), until)
-                    _account_gate[0] = max(_account_gate[0], until)
-                    log.info(f"Part {part} 限流 {type(e).__name__} {wait}s → DC{dc_id}+账号 闸门 +{capped:.0f}s（继续等，不失败）")
+                    log.info(f"Part {part} 限流 {type(e).__name__} {wait}s → 等待后重试（不失败）")
+                    await asyncio.sleep(capped)
                     continue
                 last_err = e
                 attempt += 1
@@ -434,10 +393,9 @@ class ParallelTransferrer:
                                 self._fetch_part(conn, state["location"], part, part_size, log,
                                                  state["dc_id"], cache_key))
 
-                        # 慢启动：开播瞬间只放 2 路，成功一块再 +1（最多 CONCURRENCY）。
-                        # 一上来 8 路会被 TG 判为突发下载 → FloodPremiumWait 8s（实测开播卡 7 秒的根因）
-                        window = min(self.START_WINDOW, self.CONCURRENCY)
-                        while next_send <= last_part and len(pending) < window:
+                        # 直接拉满并发（不做慢启动：慢启动会让每个新流开头的吞吐只有 1/8，
+                        # 实测体验是「点开要等几秒才流畅」；直接并发反而更快）
+                        while next_send <= last_part and len(pending) < self.CONCURRENCY:
                             _launch(next_send)
                             next_send += 1
 
@@ -452,9 +410,7 @@ class ParallelTransferrer:
                             elif next_yield == last_part:
                                 data = data[:last_part_cut]
                             log.debug(f"Part {next_yield}/{last_part} (total {part_count}) downloaded")
-                            if window < self.CONCURRENCY:
-                                window += 1
-                            while next_send <= last_part and len(pending) < window:
+                            while next_send <= last_part and len(pending) < self.CONCURRENCY:
                                 _launch(next_send)
                                 next_send += 1
                             yield data

@@ -36,10 +36,6 @@ MSG_CACHE_MAX = 800
 MSG_CACHE_TTL = 600            # 命中有效期（秒）
 MSG_NONE_TTL = 45              # 取不到消息的负缓存（秒，防去重/删掉的视频每段都打 TG）
 _warm_tasks: set = set()       # 后台预热任务的强引用（asyncio 只持弱引用，不存会被 GC）
-_dc_warmed: set = set()        # 已发起过预热的 DC（列表页看到就预热一次，换片不用再等建连）
-# 播放页预取首段字节数：打开播放页时只把开头这么多内容拉进内存分块缓存，
-# 点击播放时服务端立刻能吐数据（浏览器只需从公网拉这几 MB，不再需要原本 preload=auto 的整段预载）。
-PRIME_BYTES = int(float(os.environ.get("TG_PRIME_MB", "2") or 2) * 1048576)
 # 频道页首屏缓存：一页消息要 2~3 秒（TG 取 30 条 + 相册补拉），短时间内重复进入直接复用
 _page_cache: dict = {}         # (c, offset_id, search) -> (ts_monotonic, items, next_offset)
 PAGE_CACHE_TTL = float(os.environ.get("TG_PAGE_CACHE_TTL", "60") or 60)
@@ -67,28 +63,6 @@ def _spawn_bg(coro) -> None:
     _warm_tasks.add(task)
     task.add_done_callback(_warm_tasks.discard)
 
-
-async def _prime_head(msg, size: int, packed: int) -> None:
-    """把开头 PRIME_BYTES 拉进内存分块缓存（不落盘、不发给客户端）。
-
-    这样「点击播放」时服务端 TTFB≈0，浏览器就不必靠 preload="auto" 整段预载
-    （实测 auto 会让每个播放页在后台拉 20MB+，同时打开几页就把账号带宽和 RPC 抢光）。
-    """
-    if PRIME_BYTES <= 0 or not size or not getattr(msg, "file", None):
-        return
-    gen = None
-    try:
-        ck = (packed, getattr(msg.file, "id", 0))
-        gen = transfer.download(msg.media, file_size=size, offset=0,
-                                limit=min(int(size), PRIME_BYTES), cache_key=ck)
-        async for _chunk in gen:
-            pass
-    except Exception:
-        log.debug("预取首段失败（不影响播放）", exc_info=True)
-    finally:
-        if gen is not None:
-            with contextlib.suppress(Exception):
-                await gen.aclose()
 CHANNELS_FILE = "/app/data/channels.json"
 PAGE_SIZE = 30
 
@@ -980,15 +954,6 @@ def _cache_msg(c: str, m: Message) -> None:
     if not c or m is None or not getattr(m, "id", None) or getattr(m, "media", None) is None:
         return
     _msg_store(f"{c}:{m.id}", m, time.monotonic())
-    # 顺手预热该媒体所在的 DC：列表页一露脸就建好连接，之后点任何一条都不用等 2~4s 建连
-    try:
-        from telethon import utils as _tu
-        dc_id, _loc = _tu.get_input_location(m.media)
-        if dc_id not in _dc_warmed:
-            _dc_warmed.add(dc_id)
-            _spawn_bg(transfer.warm(dc_id))
-    except Exception:
-        pass
 
 
 def _item_json(m: Message, peer, username: str = "") -> dict:
@@ -1329,10 +1294,7 @@ async def watch_page(req: web.Request) -> web.Response:
     try:
         from telethon import utils as _tu
         _dc_id, _loc = _tu.get_input_location(m.media)
-        _spawn_bg(transfer.warm(_dc_id))
-        # 只预取开头 PRIME_BYTES（默认 2MB）到内存分块缓存：点击播放时服务端立即能吐，
-        # 浏览器不必像 preload="auto" 那样整段预载（实测开一页会后台拉 20MB+，拖慢其它请求）。
-        _spawn_bg(_prime_head(m, size, packed))
+        _spawn_bg(transfer.warm(_dc_id, 2))   # 只为这条视频所在的 DC 建 2 条连接（不做全 DC 预热）
     except Exception:
         pass
     q = "?c=" + c_q
@@ -1347,9 +1309,8 @@ async def watch_page(req: web.Request) -> web.Response:
     else:
         # 微信 X5 内核：playsinline + x5-video-player-type=h5 让视频在页面内播放（而非全屏/下载）
         # 续播：localStorage 记录该视频进度（按 packed id），下次进入自动跳到上次位置
-        # preload="metadata"：不在后台狂拉（auto 会让每个播放页预载 20MB+，把列表页/缩略图拖慢）。
-        # 点击播放的即时性改由服务端保证：打开本页时已把开头 2MB 预取进内存分块缓存（_prime_head），
-        # 点击后服务端 TTFB≈0，浏览器只需从本机拉这几 MB 就能出画面。
+        # preload="metadata"：交回浏览器原生行为（点播放才大量拉流）。
+        # 不在服务端做预取、也不让浏览器整段预载：两者都会和真正的播放抢带宽。
         player = ('<video id="vmain" controls preload="metadata" playsinline '
                   'webkit-playsinline x5-playsinline x5-video-player-type="h5" src="%s"></video>') % stream
     dl_hint = ""  # 用户要求不提供下载按钮
@@ -1526,11 +1487,6 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang S
 /* 图片 lightbox 查看器 */
 #lb{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.94);display:none;flex-direction:column;align-items:center;justify-content:center;touch-action:none;user-select:none;-webkit-user-select:none}
 #lb.open{display:flex}
-#vp{position:fixed;inset:0;z-index:110;background:#000;display:none;align-items:center;justify-content:center}
-#vp.on{display:flex}
-#vp video{width:100%;max-height:100vh;background:#000}
-#vpx{position:absolute;top:12px;right:12px;width:42px;height:42px;border-radius:21px;border:0;
-background:rgba(255,255,255,.16);color:#fff;font-size:18px;line-height:1;z-index:2}
 #lb img.lb-img{max-width:96vw;max-height:82vh;object-fit:contain;border-radius:6px;background:#000;box-shadow:0 8px 40px rgba(0,0,0,.6)}
 #lb .lb-top{position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:center;padding:14px 18px;color:#fff;font-size:13px;z-index:2}
 #lb .lb-x{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.12);border:none;color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center}
@@ -1596,7 +1552,6 @@ background:rgba(255,255,255,.16);color:#fff;font-size:18px;line-height:1;z-index
 <div class="tagbar" id="tagbar" style="display:none"></div>
 <div class="feed" id="feed">__MSGS__</div>
 <div class="loading" id="sentinel" data-next="__FIRST_NEXT__" style="display:__DISPLAY__">↑ 上滑加载更多 ↑</div>
-<div id="vp"><video id="vpv" controls playsinline webkit-playsinline x5-playsinline x5-video-player-type="h5"></video><button id="vpx" type="button">✕</button></div>
 <div id="lb"><div class="lb-top"><span class="lb-idx" id="lbIdx"></span><button class="lb-x" onclick="lbClose()">✕</button></div><button class="lb-nav lb-prev" onclick="lbPrev()">‹</button><img class="lb-img" id="lbImg" alt=""><button class="lb-nav lb-next" onclick="lbNext()">›</button><div class="lb-cap" id="lbCap"></div></div>
 <script>
 const CHAN="__CHAN__";
@@ -1661,76 +1616,10 @@ feed.addEventListener('click',e=>{
   const a=e.target.closest('a'); if(a) return;
   const m=e.target.closest('.msg'); if(m&&m.dataset.watch) location.href=m.dataset.watch;
 });
-// —— 内嵌播放层：点卡片直接在本页播放 ——
-// 为什么不用跳转 /watch：自动播放（无用户手势）时浏览器会等缓冲到很大才出画面（实测 3~9s），
-// 而在点击回调里直接 play() 是有用户手势的，实测 0.6s 就出画面，且不用点第二次。
-const vp=document.getElementById('vp'), vpv=document.getElementById('vpv'), vpx=document.getElementById('vpx');
-let vpKey=null, vpSaved=0, vpJumped=false;
-let vpEv=[], vpT0=0, vpReported=false;
-['loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','suspend'].forEach(function(k){
-  vpv.addEventListener(k,function(){ vpEv.push(k+':'+Math.round(performance.now()-vpT0)); });
-});
-vpv.addEventListener('playing',function(){
-  if(vpReported) return; vpReported=true;
-  try{ fetch('/sperf',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',
-    body:JSON.stringify({msg:vpKey,tag:'overlay',playing:Math.round(performance.now()-vpT0),ev:vpEv.slice(0,12),
-      rs:vpv.readyState, buf:(vpv.buffered.length?+vpv.buffered.end(0).toFixed(1):0),
-      ua:navigator.userAgent.slice(0,60)})}); }catch(e){}
-},{once:true});
-function vpSave(){ if(vpKey && vpv.currentTime>5){ try{localStorage.setItem(vpKey,String(vpv.currentTime));}catch(e){} } }
-function openPlayer(watchUrl){
-  if(vp.classList.contains('on')) closePlayer();
-  const sUrl=watchUrl.replace('/watch/','/s/');
-  const mid=(watchUrl.split('/watch/')[1]||'').split('/')[0];   // 不用正则，避免反斜杠转义问题
-  vpKey=mid?('tgpos_'+mid):null;
-  vpSaved=0; vpJumped=false; vpEv=[]; vpReported=false; vpT0=performance.now();
-  try{ vpSaved=parseFloat(localStorage.getItem(vpKey))||0; }catch(e){}
-  // 顺序很重要：先把播放层显示出来，再给 <video> 赋 src 并立即 play()。
-  // 若在 display:none 的容器里赋 src，部分浏览器会推迟加载/解码（实测首帧多等数秒）。
-  vp.classList.add('on');
-  document.body.style.overflow='hidden';
-  try{ vpv.src=sUrl; }catch(e){}
-  try{ vpv.load(); }catch(e){}
-  const p=vpv.play();               // 在点击回调内 → 用户手势有效
-  if(p&&typeof p.catch==='function') p.catch(function(){});
-  try{ history.pushState({vp:1},''); }catch(e){}
-}
-function closePlayer(){
-  vpSave();
-  try{ vpv.pause(); }catch(e){}
-  vpv.removeAttribute('src'); try{vpv.load();}catch(e){}
-  vp.classList.remove('on');
-  document.body.style.overflow='';
-}
-if(vpx) vpx.addEventListener('click',function(){ if(history.state&&history.state.vp){history.back();} else {closePlayer();} });
-// 续播：先播起来，播稳后再跳到上次位置（避免一上来就 seek 卡住）
-vpv.addEventListener('timeupdate',function(){
-  if(!vpJumped && vpSaved>5 && vpv.duration && vpSaved<vpv.duration-5 && vpv.currentTime>2){
-    vpJumped=true; try{vpv.currentTime=vpSaved;}catch(e){}
-  }
-});
-vpv.addEventListener('playing',function(){ setTimeout(function(){
-  if(!vpJumped && vpSaved>5){ vpJumped=true; try{vpv.currentTime=vpSaved;}catch(e){} }
-},1500); },{once:true});
-window.addEventListener('popstate',function(){ if(vp.classList.contains('on')) closePlayer(); });
-window.addEventListener('beforeunload', vpSave);
-setInterval(vpSave, 3000);
-// —— 预热：列表渲染后预取前几条视频的头部 1MB 进服务端内存缓存 ——
-// 目的：点开时首块已命中缓存（服务端 TTFB 0.00s），消掉 TG 首字节 1~5s 的重尾延迟。
-function vpWarm(m){
-  if(!m||!m.dataset||!m.dataset.watch) return;
-  const u=m.dataset.watch.replace('/watch/','/s/');
-  try{ fetch(u,{headers:{Range:'bytes=0-1048575'},credentials:'include'}).then(function(r){return r.arrayBuffer();}).catch(function(){}); }catch(e){}
-}
-function vpWarmFirst(n){
-  const cards=document.querySelectorAll('[data-watch]');
-  for(let i=0;i<n && i<cards.length;i++) vpWarm(cards[i]);
-}
-if('requestIdleCallback' in window){ requestIdleCallback(function(){vpWarmFirst(3);},{timeout:2000}); }
-else { setTimeout(function(){vpWarmFirst(3);},1500); }
-// 手指/鼠标按下就优先预热这一条（多争取 1~2 秒）
-document.addEventListener('touchstart',function(e){ const m=e.target.closest&&e.target.closest('[data-watch]'); if(m) vpWarm(m); },{passive:true});
-document.addEventListener('mousedown',function(e){ const m=e.target.closest&&e.target.closest('[data-watch]'); if(m) vpWarm(m); });
+// —— 列表页不再做任何视频预热 ——
+// 曾经用 fetch(Range: 0-1MB) 预热前几条视频（idle 3 条 + 每次 touchstart 1 条），
+// 实测每开一个列表页就白拉 3~6MB，用户点开播放时这些预取还在跑，直接和播放抢带宽
+// （表现为「越用越卡」）。预热交给服务端按需做，客户端不再发这些请求。
 async function loadMore(){
   if(loading) return; loading=true;
   const off=sentinel.dataset.next; if(!off){loading=false;return}

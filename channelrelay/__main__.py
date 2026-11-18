@@ -110,32 +110,11 @@ async def start() -> None:
     await runner.setup()
     await web.TCPSite(runner, host, port).start()
 
-    # 后台把全部 DC 都预热好：视频文件可能落在任意 DC（实测有 DC1/4/5），
-    # 不预热的话「第一次播某个 DC 的片」要现建连+导出授权，实测首帧 8.8s；预热后 0.6s。
-    _bg.add(asyncio.ensure_future(_warm_all_dcs()))
-
-
-_bg: set = set()
-
-
-async def _warm_all_dcs() -> None:
-    # 顺序：主 DC 已预热，接着是最常见的文件 DC，再兜底其余
-    for dc in (4, 1, 2, 3, 5):
-        try:
-            await transfer.warm(dc)
-        except Exception:
-            log.warning("warm DC%d failed", dc, exc_info=True)
-        await asyncio.sleep(1.5)
+    # 不在启动时批量预热所有 DC：5 个 DC × 4 条 = 20 条 MTProto 连接全挂在同一个 socks5 代理上，
+    # 会把代理和账号都拖慢（实测页面与播放一起变卡）。改成按需建连，播放页只预热目标 DC 的 2 条。
 
 
 async def stop() -> None:
-    # 先取消后台预热任务：否则关机窗口里还在建连/睡眠，client.disconnect() 之后报一堆无意义错误
-    tasks = list(_bg)
-    _bg.clear()
-    for t in tasks:
-        t.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
     await runner.cleanup()
     await client.disconnect()
 
