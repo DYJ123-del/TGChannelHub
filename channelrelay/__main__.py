@@ -40,7 +40,22 @@ async def _setup_middleware(req: web.Request, handler):
         return web.Response(status=302, headers={"Location": "/setup", "Cache-Control": "no-store"})
     return await handler(req)
 
-server = web.Application(middlewares=[_setup_middleware])
+@web.middleware
+async def _no_store_html(req: web.Request, handler):
+    """HTML 页面一律不缓存：页面内联了 JS，浏览器缓存旧版会让用户跑到过期逻辑
+    （实测手机端仍在跑旧的播放层代码 → 一直转圈）。"""
+    resp = await handler(req)
+    try:
+        ct = str(resp.headers.get("Content-Type", "")).lower()
+        if ct.startswith("text/html") or ct.startswith("application/json"):
+            resp.headers["Cache-Control"] = "no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+    except Exception:
+        pass
+    return resp
+
+
+server = web.Application(middlewares=[_setup_middleware, _no_store_html])
 # 原版无鉴权路由（/{id}/{name} 直链流）已弃用——存在未授权访问与 Content-Range off-by-one 问题，
 # 全部播放/下载走 channel_ui（/s/ 等，带分享密码鉴权）。不注册原版 routes。
 server.add_routes(ui_routes)
@@ -95,8 +110,32 @@ async def start() -> None:
     await runner.setup()
     await web.TCPSite(runner, host, port).start()
 
+    # 后台把全部 DC 都预热好：视频文件可能落在任意 DC（实测有 DC1/4/5），
+    # 不预热的话「第一次播某个 DC 的片」要现建连+导出授权，实测首帧 8.8s；预热后 0.6s。
+    _bg.add(asyncio.ensure_future(_warm_all_dcs()))
+
+
+_bg: set = set()
+
+
+async def _warm_all_dcs() -> None:
+    # 顺序：主 DC 已预热，接着是最常见的文件 DC，再兜底其余
+    for dc in (4, 1, 2, 3, 5):
+        try:
+            await transfer.warm(dc)
+        except Exception:
+            log.warning("warm DC%d failed", dc, exc_info=True)
+        await asyncio.sleep(1.5)
+
 
 async def stop() -> None:
+    # 先取消后台预热任务：否则关机窗口里还在建连/睡眠，client.disconnect() 之后报一堆无意义错误
+    tasks = list(_bg)
+    _bg.clear()
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     await runner.cleanup()
     await client.disconnect()
 

@@ -1,11 +1,16 @@
 # channel_ui.py — 频道代理 Web UI（在 tgfilestream 内核上新增）
 # 路由：/ (列表页,鉴权)  /login (POST 密码)  /list (JSON 分页,鉴权)
 #       /thumb/{id} (缩略图,鉴权)  /watch/{id}/{name} (播放页,不鉴权)  /s/{id}/{name} (频道流式,Range)
-import hashlib, logging, os, time
+import hashlib, hmac, logging, os, time
+import asyncio
+import contextlib
+import html as _html
 from typing import cast
+from weakref import WeakValueDictionary
 
 from aiohttp import web
 from telethon.tl.custom import Message
+from telethon.errors import FileReferenceExpiredError, FileReferenceInvalidError
 from telethon.tl.types import (DocumentAttributeVideo,
                                DocumentAttributeAudio, MessageMediaDocument,
                                MessageMediaPhoto)
@@ -22,6 +27,38 @@ ADMIN_COOKIE = "tgadmin_auth"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 天（未启用；改为会话级 cookie 后浏览器关闭即失效）
 thumb_cache: dict = {}
 THUMB_CACHE_MAX = 500  # 内存缩略图缓存上限，防无限增长
+# 消息对象缓存：/s/ 每段 Range 请求原本都要 get_messages()（一次 TG RPC，实测 0.1~0.9s），
+# 缓存后每段省掉一次往返，首字节延迟近乎减半。key = f"{频道}:{msg_id}"
+_msg_cache: dict = {}          # key -> (ts_monotonic, msg | None)
+# single-flight 锁：用弱引用字典，否则每个播放过的视频都会永久留一个 Lock（_msg_cache 有上限，它没有）
+_msg_locks: "WeakValueDictionary[str, asyncio.Lock]" = WeakValueDictionary()
+MSG_CACHE_MAX = 800
+MSG_CACHE_TTL = 600            # 命中有效期（秒）
+MSG_NONE_TTL = 45              # 取不到消息的负缓存（秒，防去重/删掉的视频每段都打 TG）
+_warm_tasks: set = set()       # 后台预热任务的强引用（asyncio 只持弱引用，不存会被 GC）
+_dc_warmed: set = set()        # 已发起过预热的 DC（列表页看到就预热一次，换片不用再等建连）
+
+# /s/ 的 Content-Type 白名单：TG 文档的 mime_type 由上传者控制，
+# 直接透传 text/html 会在本站同源内执行任意 HTML/JS（上传者可控的存储型 XSS）。
+ALLOWED_MEDIA_MIME = {
+    "video/mp4", "video/webm", "video/quicktime", "video/x-matroska", "video/x-msvideo",
+    "video/mpeg", "video/3gpp", "video/x-flv", "video/mp2t",
+    "audio/mpeg", "audio/mp3", "audio/mp4", "audio/aac", "audio/ogg", "audio/flac",
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+    "application/octet-stream", "application/pdf",
+}
+
+
+def _safe_media_type(mime) -> str:
+    """白名单化 mime：不认识的一律 octet-stream（同时挡掉含 CR/LF 的非法头值）。"""
+    mt = (mime or "").split(";")[0].strip().lower()
+    return mt if mt in ALLOWED_MEDIA_MIME else "application/octet-stream"
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.ensure_future(coro)
+    _warm_tasks.add(task)
+    task.add_done_callback(_warm_tasks.discard)
 CHANNELS_FILE = "/app/data/channels.json"
 PAGE_SIZE = 30
 
@@ -182,6 +219,80 @@ def _msg_entity(peer):
     return peer
 
 
+def _msg_belongs(msg, peer) -> bool:
+    """缓存里的 Message 是否确实属于当前 peer（防跨频道串台）。拿不准一律放过。"""
+    chat_id = getattr(msg, "chat_id", None)
+    peer_id = getattr(peer, "id", None)
+    if chat_id is None or peer_id is None:
+        return True
+    return chat_id == peer_id or chat_id == getattr(peer, "chat_id", None)
+
+
+def _msg_evict(now: float) -> None:
+    """淘汰一条：优先清过期项，没有过期项就丢最早插入的（保持实现简单）。"""
+    dead = [k for k, v in _msg_cache.items()
+            if now - v[0] >= (MSG_CACHE_TTL if v[1] is not None else MSG_NONE_TTL)]
+    for k in (dead or [next(iter(_msg_cache))]):
+        _msg_cache.pop(k, None)
+
+
+def _msg_store(ckey: str, msg, now: float) -> None:
+    if len(_msg_cache) >= MSG_CACHE_MAX:
+        _msg_evict(now)
+    _msg_cache[ckey] = (now, msg)
+
+
+def _msg_hit(ckey: str, peer, now: float, refresh: bool = False):
+    """返回 (命中与否, msg)。None 也缓存（负缓存），但只在 peer 校验通过时返回。"""
+    hit = _msg_cache.get(ckey)
+    if not hit or refresh:
+        return False, None
+    ts, msg = hit
+    ttl = MSG_CACHE_TTL if msg is not None else MSG_NONE_TTL
+    if now - ts >= ttl:
+        return False, None
+    if msg is not None and not _msg_belongs(msg, peer):
+        _msg_cache.pop(ckey, None)
+        return False, None
+    return True, msg
+
+
+async def _get_cached_msg(c: str, peer, msg_id: int, refresh: bool = False):
+    """带缓存取消息（single-flight + 负缓存 + peer 校验 + 单调时钟 TTL）。
+
+    refresh=True 用于 file_reference 失效后强制重取（Telethon 重取会刷新引用）。
+    """
+    if not c:
+        return None
+    ckey = f"{c}:{msg_id}"
+    ok, msg = _msg_hit(ckey, peer, time.monotonic(), refresh)
+    if ok:
+        return msg
+    lock = _msg_locks.get(ckey)
+    if lock is None:
+        lock = asyncio.Lock()
+        _msg_locks[ckey] = lock
+    async with lock:
+        ok, msg = _msg_hit(ckey, peer, time.monotonic(), refresh)
+        if ok:
+            return msg
+        failed = False
+        try:
+            msg = cast(Message, await client.get_messages(entity=_msg_entity(peer), ids=msg_id))
+            # Telethon 在某些情况下对单 id 也会返回 TotalList（消息不存在时），统一归一化
+            if isinstance(msg, list):
+                msg = msg[0] if msg else None
+        except Exception:
+            log.warning("取消息失败 c=%s id=%s", c, msg_id, exc_info=True)
+            msg = None
+            failed = True
+        # 只有「RPC 正常返回 None」才写负缓存：异常（限流/网络抖动）写进去会把这条消息
+        # 钉死 45 秒 → 期间每一段 Range 都直接 404，播放必死且不自愈。
+        if not failed:
+            _msg_store(ckey, msg, time.monotonic())
+        return msg
+
+
 def _peer_by_packed(packed: int):
     """从 packed id 反查 peer（用于 /thumb /watch /s 等按 chat_id 定位）。"""
     chat_id = (packed >> chat_id_offset) & pack_bit_mask
@@ -191,19 +302,36 @@ def _peer_by_packed(packed: int):
 def _auth_ok(req: web.Request) -> bool:
     """分享密码（访客浏览频道页）。"""
     if not ui_password:
+        log.error("TG_UI_PASSWORD 为空：分享链接无鉴权，请到管理页或环境变量设置密码")
         return True
     ck = req.cookies.get(AUTH_COOKIE, "")
     expect = hashlib.sha256(("tgui:" + ui_password).encode()).hexdigest()
-    return ck == expect
+    return hmac.compare_digest(ck, expect)
 
 
 def _admin_ok(req: web.Request) -> bool:
     """管理密码（管理页）。"""
     if not admin_password:
+        log.error("TG_ADMIN_PASSWORD 为空：管理页无鉴权，请设置管理密码")
         return True
     ck = req.cookies.get(ADMIN_COOKIE, "")
     expect = hashlib.sha256(("tgadmin:" + admin_password).encode()).hexdigest()
-    return ck == expect
+    return hmac.compare_digest(ck, expect)
+
+
+def _pw_ok(given, expected) -> bool:
+    """常量时间比密码（表单值/配置值都可能是 bytes，统一成 str 再比）。"""
+    def _as_str(v):
+        if isinstance(v, (bytes, bytearray)):
+            try:
+                return bytes(v).decode("utf-8", "ignore")
+            except Exception:
+                return None
+        return v if isinstance(v, str) else None
+    a, b = _as_str(given), _as_str(expected)
+    if a is None or b is None:
+        return False
+    return hmac.compare_digest(a, b)
 
 
 def _pack(chat_id: int, msg_id: int) -> int:
@@ -813,7 +941,28 @@ async def more_api(req: web.Request) -> web.Response:
     return web.json_response({"html": "\n".join(frag), "next": next_offset})
 
 
+def _cache_msg(c: str, m: Message) -> None:
+    """把已拿到的消息对象塞进缓存（列表页渲染时顺手做），播放页就少一次 TG 往返。
+
+    只缓存带媒体的消息：纯文字消息也入缓存的话，翻几页就把 800 条顶满，
+    之后新消息永不入缓存（审计报告指出的「缓存冻结」问题）。
+    """
+    if not c or m is None or not getattr(m, "id", None) or getattr(m, "media", None) is None:
+        return
+    _msg_store(f"{c}:{m.id}", m, time.monotonic())
+    # 顺手预热该媒体所在的 DC：列表页一露脸就建好连接，之后点任何一条都不用等 2~4s 建连
+    try:
+        from telethon import utils as _tu
+        dc_id, _loc = _tu.get_input_location(m.media)
+        if dc_id not in _dc_warmed:
+            _dc_warmed.add(dc_id)
+            _spawn_bg(transfer.warm(dc_id))
+    except Exception:
+        pass
+
+
 def _item_json(m: Message, peer, username: str = "") -> dict:
+    _cache_msg(username, m)
     media = m.media
     # 纯文字消息无 file，get_file_name 会崩——text 消息不给 name
     name = get_file_name(m) if (m and m.file) else ""
@@ -957,11 +1106,11 @@ async def thumb(req: web.Request) -> web.Response:
     if ckey in thumb_cache:
         data, mime = thumb_cache[ckey]
         return web.Response(body=data, content_type=mime,
-                            headers={"Cache-Control": "public, max-age=86400"})
+                            headers={"Cache-Control": "private, max-age=86400"})
     peer = await _get_peer(c)
     if not peer:
         return web.Response(status=404, text="no peer")
-    m = cast(Message, await client.get_messages(entity=_msg_entity(peer), ids=msg_id))
+    m = cast(Message, await _get_cached_msg(c, peer, msg_id))
     if not m or not m.media or not _thumb_of(m.media):
         return web.Response(status=404, text="no thumb")
     try:
@@ -975,7 +1124,7 @@ async def thumb(req: web.Request) -> web.Response:
         thumb_cache.pop(next(iter(thumb_cache)))  # 超上限丢最早一条
     thumb_cache[ckey] = (data, "image/jpeg")
     return web.Response(body=data, content_type="image/jpeg",
-                        headers={"Cache-Control": "public, max-age=86400"})
+                        headers={"Cache-Control": "private, max-age=86400"})
 
 
 @routes.get(r"/s/{id:\d+}/{name}")
@@ -992,7 +1141,7 @@ async def channel_stream(req: web.Request) -> web.Response:
     peer = await _get_peer(c)
     if not peer:
         return web.Response(status=404, text="404: Not Found")
-    message = cast(Message, await client.get_messages(entity=_msg_entity(peer), ids=msg_id))
+    message = cast(Message, await _get_cached_msg(c, peer, msg_id))
     if not message or not message.file or get_file_name(message) != file_name:
         return web.Response(status=404, text="404: Not Found")
     size = message.file.size
@@ -1007,13 +1156,45 @@ async def channel_stream(req: web.Request) -> web.Response:
                             headers={"Content-Range": f"bytes */{size}"})
     if req.method != "HEAD":
         log.info(f"Streaming {message.id} Range: {offset}-{limit}")
-        body = transfer.download(message.media, file_size=size, offset=offset, limit=limit)
+
+        async def _refresh_media():
+            """file_reference 过期时重取消息（Telethon 重取会刷新 file_reference）。"""
+            m2 = await _get_cached_msg(c, peer, msg_id, refresh=True)
+            return m2.media if (m2 and m2.file) else None
+
+        # 直接返回流（响应头先发，播放器立刻开始缓冲）；
+        # 分块失败由 paralleltransfer 内部重试，重试耗尽才中断连接（不会静默截断）。
+        gen = transfer.download(message.media, file_size=size, offset=offset, limit=limit,
+                                refresh_cb=_refresh_media,
+                                cache_key=(packed, getattr(message.file, "id", 0)))
+
+        async def _timed_body():
+            """包装生成器：记录服务端首字节耗时（排障关键指标）。"""
+            t0 = time.monotonic()
+            first = True
+            total = 0
+            try:
+                async for chunk in gen:
+                    if first:
+                        log.info(f"TTFB msg={message.id} off={offset} 首字节={time.monotonic()-t0:.2f}s")
+                        first = False
+                    total += len(chunk)
+                    yield chunk
+                log.info(f"DONE msg={message.id} off={offset} 共{total/1048576:.2f}MB "
+                         f"用时{time.monotonic()-t0:.2f}s")
+            finally:
+                # 客户端断开时 aiohttp 只 aclose 外层：不关内层，6 路在途分块会继续拉流
+                with contextlib.suppress(Exception):
+                    await gen.aclose()
+
+        body = _timed_body()
     else:
         body = None
     # HTTP Content-Range end 为闭区间（end = start + len - 1），原版多算 1，微信 X5 严格校验会拒播
     end = limit - 1 if limit > 0 else 0
     headers = {
-        "Content-Type": message.file.mime_type,
+        "Content-Type": _safe_media_type(getattr(message.file, "mime_type", None)),
+        "X-Content-Type-Options": "nosniff",
         "Content-Range": f"bytes {offset}-{end}/{size}",
         "Content-Length": str(limit - offset),
         "Accept-Ranges": "bytes",
@@ -1033,6 +1214,22 @@ async def channel_stream(req: web.Request) -> web.Response:
                         body=body, headers=headers)
 
 
+@routes.post("/sperf")
+async def stream_perf(req: web.Request) -> web.Response:
+    """客户端首帧耗时上报（只用于排障，写日志即可）。"""
+    if not _auth_ok(req):
+        return web.Response(status=401)
+    try:
+        d = await req.json()
+    except Exception:
+        return web.Response(status=400)
+    if not isinstance(d, dict):
+        return web.Response(status=400)
+    log.info("PERF %s", {k: d.get(k) for k in
+                          ("msg", "playing", "nav_ttfb", "dcl", "rs", "buf", "cur", "tag", "ua", "ev")})
+    return web.Response(status=204)
+
+
 @routes.post("/login")
 async def login(req: web.Request) -> web.Response:
     """分享密码登录（访客）。登录后跳回来源页（next），默认 /c 频道总入口。"""
@@ -1042,7 +1239,7 @@ async def login(req: web.Request) -> web.Response:
     # 防开放重定向：仅允许站内相对路径（必须以单个 / 开头、不含反斜杠、非 // 协议相对）
     if not next_url.startswith("/") or next_url.startswith("//") or "\\" in next_url or "://" in next_url:
         next_url = "/c"
-    if pw == ui_password:
+    if _pw_ok(pw, ui_password):
         val = hashlib.sha256(("tgui:" + ui_password).encode()).hexdigest()
         resp = web.Response(status=302, headers={"Location": next_url})
         # 会话级 cookie（不设 max_age）：浏览器关闭即失效，退出后需重新输密码
@@ -1057,7 +1254,7 @@ async def admin_login(req: web.Request) -> web.Response:
     """管理密码登录。"""
     data = await req.post()
     pw = data.get("password", "")
-    if pw == admin_password:
+    if _pw_ok(pw, admin_password):
         val = hashlib.sha256(("tgadmin:" + admin_password).encode()).hexdigest()
         resp = web.Response(status=302, headers={"Location": "/manage"})
         # 会话级 cookie（不设 max_age）：浏览器关闭即失效，退出后需重新输密码
@@ -1080,14 +1277,24 @@ async def watch_page(req: web.Request) -> web.Response:
     if not peer:
         return web.Response(status=404, text="404: Not Found")
     import urllib.parse as _up
-    c_q = _up.quote(c)      # URL 编码（防属性注入；_get_peer 已挡非法名，双保险）
+    c_q = _up.quote(c, safe="")   # URL 编码（防属性注入；_get_peer 已挡非法名，双保险）
     msg_id = (packed >> msg_id_offset) & pack_bit_mask
-    m = cast(Message, await client.get_messages(entity=_msg_entity(peer), ids=msg_id))
+    m = cast(Message, await _get_cached_msg(c, peer, msg_id))
     if not m or not m.media:
         return web.Response(status=404, text="404: Not Found")
     size = getattr(getattr(m.media, "document", None) or m.media, "size", 0)
+    # 打开播放页就预热目标 DC 连接（首播省掉 2~4s 的连接+导出授权；失败不影响播放）
+    try:
+        from telethon import utils as _tu
+        _dc_id, _loc = _tu.get_input_location(m.media)
+        _spawn_bg(transfer.warm(_dc_id))
+    except Exception:
+        pass
     q = "?c=" + c_q
-    stream = f"/s/{packed}/{name}{q}"
+    # 文件名必须 URL 编码：含 # / ? / % 时必须编码，否则浏览器会把 # 之后当锚点丢弃、
+    # 把 % 当百分号转义 → 合法文件也 404（审计实测 /s/Ep#1 final.mp4 → 请求变成 /s/Ep）
+    name_q = _up.quote(name, safe="")
+    stream = f"/s/{packed}/{name_q}{q}"
     thumb_url = f"/thumb/{packed}{q}"
     is_photo = _thumb_kind(m.media) == "photo"
     if is_photo:
@@ -1095,10 +1302,14 @@ async def watch_page(req: web.Request) -> web.Response:
     else:
         # 微信 X5 内核：playsinline + x5-video-player-type=h5 让视频在页面内播放（而非全屏/下载）
         # 续播：localStorage 记录该视频进度（按 packed id），下次进入自动跳到上次位置
-        player = ('<video id="vmain" controls preload="metadata" playsinline webkit-playsinline '
-                  'x5-playsinline x5-video-player-type="h5" src="%s"></video>') % stream
+        # preload="auto"：页面打开即开始缓冲（实测 Chrome 缓冲 13s 就停，不会拉整片），
+        # 用户点击原生播放键时数据已就位 → 立即出画面。曾用 preload="metadata"：
+        # 点击前只缓冲 0.5s，点击后才从零开始拉流，体感要等 4~8s。
+        # 不再用自定义大播放键（会与原生 controls 的播放键重叠，出现两个按钮）。
+        player = ('<video id="vmain" controls preload="auto" playsinline '
+                  'webkit-playsinline x5-playsinline x5-video-player-type="h5" src="%s"></video>') % stream
     dl_hint = ""  # 用户要求不提供下载按钮
-    name_esc = name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    name_esc = _html.escape(name, quote=True)
     back_href = "/c/" + c_q  # 返回频道页（URL 已编码，根路径是管理入口不能回 /）
     html = f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1126,18 +1337,46 @@ video{{width:100%;border-radius:12px;background:#000;box-shadow:0 8px 30px rgba(
   var saved=0;
   try{{ saved=parseFloat(localStorage.getItem(KEY))||0; }}catch(e){{}}
   var jumped=false;
-  v.addEventListener('loadedmetadata',function(){{
-    if(saved>5 && saved<v.duration-5 && !jumped){{
-      jumped=true;
-      try{{ v.currentTime=saved; }}catch(e){{}}
-    }}
+  // 续播不要一进页面就 seek：那一秒还没有数据，会卡在 readyState=1（无画面）等好几秒。
+  // 改成「先从头播起来，播稳之后再跳到上次位置」（实测从 4~8 秒无画面降到立刻出画面）。
+  function doResume(){{
+    if(jumped || !saved) return;
+    if(!(saved>5 && saved<v.duration-5)) return;
+    jumped=true;
+    try{{ v.currentTime=saved; }}catch(e){{}}
+  }}
+  v.addEventListener('timeupdate',function(){{
+    if(!jumped && v.currentTime>2) doResume();
   }});
+  v.addEventListener('playing',function(){{ setTimeout(doResume,1500); }},{{once:true}});
+  // 首帧耗时上报（排障用）：记录 页面TTFB / DOM就绪 / 首次 playing 的时刻 + 播放器事件时间线
+  var evlog=[];
+  ['loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','suspend','error']
+    .forEach(function(k){{ v.addEventListener(k,function(){{ evlog.push(k+':'+Math.round(performance.now())); }}); }});
+  var perfSent=false;
+  function sendPerf(tag){{
+    if(perfSent) return; perfSent=true;
+    try{{
+      var nav=(performance.getEntriesByType('navigation')[0]||{{}});
+      fetch('/sperf',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+        credentials:'include',
+        body:JSON.stringify({{msg:{packed}, tag:tag, playing:Math.round(performance.now()),
+          nav_ttfb:Math.round(nav.responseStart||0), dcl:Math.round(nav.domContentLoadedEventEnd||0),
+          rs:v.readyState, buf:(v.buffered.length?+v.buffered.end(0).toFixed(1):0),
+          cur:+(v.currentTime||0).toFixed(1), ua:navigator.userAgent.slice(0,70),
+          ev:evlog.slice(0,12)}})}});
+    }}catch(e){{}}
+  }}
+  v.addEventListener('playing',function(){{sendPerf('playing');}},{{once:true}});
+  v.addEventListener('error',function(){{sendPerf('error');}},{{once:true}});
   // 定期保存进度（1s 节流）
   var timer=null;
   v.addEventListener('timeupdate',function(){{
     if(!timer){{
       timer=setTimeout(function(){{
         timer=null;
+        // 续播尚未跳转前不要覆盖已保存的进度（否则从 0 播 2 秒就把 200 秒的进度冲掉了）
+        if(!jumped && saved>5) return;
         if(v.currentTime>5){{
           try{{ localStorage.setItem(KEY, String(v.currentTime)); }}catch(e){{}}
         }}
@@ -1150,6 +1389,8 @@ video{{width:100%;border-radius:12px;background:#000;box-shadow:0 8px 30px rgba(
       try{{ localStorage.setItem(KEY, String(v.currentTime)); }}catch(e){{}}
     }}
   }});
+  // 点击视频区域也能起播（原生 controls 的播放键照常可用）
+  v.addEventListener('click',function(){{ if(v.paused) v.play(); }});
 }})();
 </script>
 </body></html>"""
@@ -1241,6 +1482,11 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang S
 /* 图片 lightbox 查看器 */
 #lb{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.94);display:none;flex-direction:column;align-items:center;justify-content:center;touch-action:none;user-select:none;-webkit-user-select:none}
 #lb.open{display:flex}
+#vp{position:fixed;inset:0;z-index:110;background:#000;display:none;align-items:center;justify-content:center}
+#vp.on{display:flex}
+#vp video{width:100%;max-height:100vh;background:#000}
+#vpx{position:absolute;top:12px;right:12px;width:42px;height:42px;border-radius:21px;border:0;
+background:rgba(255,255,255,.16);color:#fff;font-size:18px;line-height:1;z-index:2}
 #lb img.lb-img{max-width:96vw;max-height:82vh;object-fit:contain;border-radius:6px;background:#000;box-shadow:0 8px 40px rgba(0,0,0,.6)}
 #lb .lb-top{position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:center;padding:14px 18px;color:#fff;font-size:13px;z-index:2}
 #lb .lb-x{width:36px;height:36px;border-radius:50%;background:rgba(255,255,255,.12);border:none;color:#fff;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center}
@@ -1306,6 +1552,7 @@ body{background:var(--bg);color:var(--txt);font-family:-apple-system,'PingFang S
 <div class="tagbar" id="tagbar" style="display:none"></div>
 <div class="feed" id="feed">__MSGS__</div>
 <div class="loading" id="sentinel" data-next="__FIRST_NEXT__" style="display:__DISPLAY__">↑ 上滑加载更多 ↑</div>
+<div id="vp"><video id="vpv" controls playsinline webkit-playsinline x5-playsinline x5-video-player-type="h5"></video><button id="vpx" type="button">✕</button></div>
 <div id="lb"><div class="lb-top"><span class="lb-idx" id="lbIdx"></span><button class="lb-x" onclick="lbClose()">✕</button></div><button class="lb-nav lb-prev" onclick="lbPrev()">‹</button><img class="lb-img" id="lbImg" alt=""><button class="lb-nav lb-next" onclick="lbNext()">›</button><div class="lb-cap" id="lbCap"></div></div>
 <script>
 const CHAN="__CHAN__";
@@ -1370,6 +1617,76 @@ feed.addEventListener('click',e=>{
   const a=e.target.closest('a'); if(a) return;
   const m=e.target.closest('.msg'); if(m&&m.dataset.watch) location.href=m.dataset.watch;
 });
+// —— 内嵌播放层：点卡片直接在本页播放 ——
+// 为什么不用跳转 /watch：自动播放（无用户手势）时浏览器会等缓冲到很大才出画面（实测 3~9s），
+// 而在点击回调里直接 play() 是有用户手势的，实测 0.6s 就出画面，且不用点第二次。
+const vp=document.getElementById('vp'), vpv=document.getElementById('vpv'), vpx=document.getElementById('vpx');
+let vpKey=null, vpSaved=0, vpJumped=false;
+let vpEv=[], vpT0=0, vpReported=false;
+['loadedmetadata','loadeddata','canplay','canplaythrough','playing','waiting','stalled','suspend'].forEach(function(k){
+  vpv.addEventListener(k,function(){ vpEv.push(k+':'+Math.round(performance.now()-vpT0)); });
+});
+vpv.addEventListener('playing',function(){
+  if(vpReported) return; vpReported=true;
+  try{ fetch('/sperf',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',
+    body:JSON.stringify({msg:vpKey,tag:'overlay',playing:Math.round(performance.now()-vpT0),ev:vpEv.slice(0,12),
+      rs:vpv.readyState, buf:(vpv.buffered.length?+vpv.buffered.end(0).toFixed(1):0),
+      ua:navigator.userAgent.slice(0,60)})}); }catch(e){}
+},{once:true});
+function vpSave(){ if(vpKey && vpv.currentTime>5){ try{localStorage.setItem(vpKey,String(vpv.currentTime));}catch(e){} } }
+function openPlayer(watchUrl){
+  if(vp.classList.contains('on')) closePlayer();
+  const sUrl=watchUrl.replace('/watch/','/s/');
+  const mid=(watchUrl.split('/watch/')[1]||'').split('/')[0];   // 不用正则，避免反斜杠转义问题
+  vpKey=mid?('tgpos_'+mid):null;
+  vpSaved=0; vpJumped=false; vpEv=[]; vpReported=false; vpT0=performance.now();
+  try{ vpSaved=parseFloat(localStorage.getItem(vpKey))||0; }catch(e){}
+  // 顺序很重要：先把播放层显示出来，再给 <video> 赋 src 并立即 play()。
+  // 若在 display:none 的容器里赋 src，部分浏览器会推迟加载/解码（实测首帧多等数秒）。
+  vp.classList.add('on');
+  document.body.style.overflow='hidden';
+  try{ vpv.src=sUrl; }catch(e){}
+  try{ vpv.load(); }catch(e){}
+  const p=vpv.play();               // 在点击回调内 → 用户手势有效
+  if(p&&typeof p.catch==='function') p.catch(function(){});
+  try{ history.pushState({vp:1},''); }catch(e){}
+}
+function closePlayer(){
+  vpSave();
+  try{ vpv.pause(); }catch(e){}
+  vpv.removeAttribute('src'); try{vpv.load();}catch(e){}
+  vp.classList.remove('on');
+  document.body.style.overflow='';
+}
+if(vpx) vpx.addEventListener('click',function(){ if(history.state&&history.state.vp){history.back();} else {closePlayer();} });
+// 续播：先播起来，播稳后再跳到上次位置（避免一上来就 seek 卡住）
+vpv.addEventListener('timeupdate',function(){
+  if(!vpJumped && vpSaved>5 && vpv.duration && vpSaved<vpv.duration-5 && vpv.currentTime>2){
+    vpJumped=true; try{vpv.currentTime=vpSaved;}catch(e){}
+  }
+});
+vpv.addEventListener('playing',function(){ setTimeout(function(){
+  if(!vpJumped && vpSaved>5){ vpJumped=true; try{vpv.currentTime=vpSaved;}catch(e){} }
+},1500); },{once:true});
+window.addEventListener('popstate',function(){ if(vp.classList.contains('on')) closePlayer(); });
+window.addEventListener('beforeunload', vpSave);
+setInterval(vpSave, 3000);
+// —— 预热：列表渲染后预取前几条视频的头部 1MB 进服务端内存缓存 ——
+// 目的：点开时首块已命中缓存（服务端 TTFB 0.00s），消掉 TG 首字节 1~5s 的重尾延迟。
+function vpWarm(m){
+  if(!m||!m.dataset||!m.dataset.watch) return;
+  const u=m.dataset.watch.replace('/watch/','/s/');
+  try{ fetch(u,{headers:{Range:'bytes=0-1048575'},credentials:'include'}).then(function(r){return r.arrayBuffer();}).catch(function(){}); }catch(e){}
+}
+function vpWarmFirst(n){
+  const cards=document.querySelectorAll('[data-watch]');
+  for(let i=0;i<n && i<cards.length;i++) vpWarm(cards[i]);
+}
+if('requestIdleCallback' in window){ requestIdleCallback(function(){vpWarmFirst(3);},{timeout:2000}); }
+else { setTimeout(function(){vpWarmFirst(3);},1500); }
+// 手指/鼠标按下就优先预热这一条（多争取 1~2 秒）
+document.addEventListener('touchstart',function(e){ const m=e.target.closest&&e.target.closest('[data-watch]'); if(m) vpWarm(m); },{passive:true});
+document.addEventListener('mousedown',function(e){ const m=e.target.closest&&e.target.closest('[data-watch]'); if(m) vpWarm(m); });
 async function loadMore(){
   if(loading) return; loading=true;
   const off=sentinel.dataset.next; if(!off){loading=false;return}
@@ -1686,6 +2003,7 @@ h1{font-size:18px;margin:0 0 4px}
 </div>
 <div id="rows">__CHANNEL_ROWS__</div>
 <script>
+const ADDED=new Set(__ADDED_SET__);
 function setMsg(m, ok){const el=document.getElementById('msg');el.textContent=m;el.style.color=ok?'#86efac':'#fca5a5';}
 function copyShare(url){
   if(navigator.clipboard && navigator.clipboard.writeText){
@@ -1704,7 +2022,7 @@ async function loadMine(){
   const r=await fetch('/manage/api/dialogs'); const d=await r.json();
   if(!d.ok){list.innerHTML='<div style="padding:12px;color:#f87171">'+d.msg+'</div>';return;}
   if(!d.items.length){list.innerHTML='<div style="padding:12px;color:#708499">没有可用的频道</div>';return;}
-  const added=new Set(__ADDED_SET__);
+  const added=ADDED;
   list.innerHTML=d.items.map(i=>{
     const u=i.username||('id:'+i.id);
     const nm=String(i.name).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -1719,8 +2037,18 @@ async function loadMine(){
 async function quickAdd(u){
   const body=new URLSearchParams({username:u});
   const r=await fetch('/manage/api/add',{method:'POST',body});
-  const d=await r.json(); setMsg(d.msg,d.ok);
-  if(d.ok){setTimeout(()=>location.reload(),800);}
+  const d=await r.json(); setMsg(d.ok ? d.msg + '（刷新页面可看到新行）' : d.msg, d.ok);
+  if(d.ok){
+    // 加完不刷新页面（刷新会折叠「加载我的频道」面板）：只把该项标记为已添加，
+    // 面板保持展开，方便连续点多个，需要手动折叠时点标题即可。
+    document.querySelectorAll('.mine-item').forEach(it=>{
+      if(it.dataset.u===u){
+        const b=it.querySelector('.add2'); if(b) b.textContent='已添加';
+        it.style.opacity='.5'; it.dataset.added='1';
+      }
+    });
+    if(ADDED.has(u)===false) ADDED.add(u);
+  }
 }
 async function addChan(){
   const v=document.getElementById('newChan').value.trim(); if(!v) return;
