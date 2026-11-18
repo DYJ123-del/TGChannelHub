@@ -37,6 +37,13 @@ MSG_CACHE_TTL = 600            # 命中有效期（秒）
 MSG_NONE_TTL = 45              # 取不到消息的负缓存（秒，防去重/删掉的视频每段都打 TG）
 _warm_tasks: set = set()       # 后台预热任务的强引用（asyncio 只持弱引用，不存会被 GC）
 _dc_warmed: set = set()        # 已发起过预热的 DC（列表页看到就预热一次，换片不用再等建连）
+# 播放页预取首段字节数：打开播放页时只把开头这么多内容拉进内存分块缓存，
+# 点击播放时服务端立刻能吐数据（浏览器只需从公网拉这几 MB，不再需要原本 preload=auto 的整段预载）。
+PRIME_BYTES = int(float(os.environ.get("TG_PRIME_MB", "2") or 2) * 1048576)
+# 频道页首屏缓存：一页消息要 2~3 秒（TG 取 30 条 + 相册补拉），短时间内重复进入直接复用
+_page_cache: dict = {}         # (c, offset_id, search) -> (ts_monotonic, items, next_offset)
+PAGE_CACHE_TTL = float(os.environ.get("TG_PAGE_CACHE_TTL", "60") or 60)
+PAGE_CACHE_MAX = 60
 
 # /s/ 的 Content-Type 白名单：TG 文档的 mime_type 由上传者控制，
 # 直接透传 text/html 会在本站同源内执行任意 HTML/JS（上传者可控的存储型 XSS）。
@@ -59,6 +66,29 @@ def _spawn_bg(coro) -> None:
     task = asyncio.ensure_future(coro)
     _warm_tasks.add(task)
     task.add_done_callback(_warm_tasks.discard)
+
+
+async def _prime_head(msg, size: int, packed: int) -> None:
+    """把开头 PRIME_BYTES 拉进内存分块缓存（不落盘、不发给客户端）。
+
+    这样「点击播放」时服务端 TTFB≈0，浏览器就不必靠 preload="auto" 整段预载
+    （实测 auto 会让每个播放页在后台拉 20MB+，同时打开几页就把账号带宽和 RPC 抢光）。
+    """
+    if PRIME_BYTES <= 0 or not size or not getattr(msg, "file", None):
+        return
+    gen = None
+    try:
+        ck = (packed, getattr(msg.file, "id", 0))
+        gen = transfer.download(msg.media, file_size=size, offset=0,
+                                limit=min(int(size), PRIME_BYTES), cache_key=ck)
+        async for _chunk in gen:
+            pass
+    except Exception:
+        log.debug("预取首段失败（不影响播放）", exc_info=True)
+    finally:
+        if gen is not None:
+            with contextlib.suppress(Exception):
+                await gen.aclose()
 CHANNELS_FILE = "/app/data/channels.json"
 PAGE_SIZE = 30
 
@@ -1048,9 +1078,14 @@ def _collect_items(msgs: list, peer, username: str = "") -> tuple:
 async def _fetch_page_with_groups(peer, username: str, offset_id: int = 0, search: str = "") -> tuple:
     """取一页消息，若末尾组未闭合则补拉更旧消息直到组完整。返回 (items, next_offset)。
     search 非空时按标签/关键词服务器端搜索（get_messages(search=...)），分页同样带 search。
-    Telegram 标签搜索需要 # 前缀，自动补。"""
+    Telegram 标签搜索需要 # 前缀，自动补。
+    结果做短 TTL 缓存：一页 2~3 秒的 RPC，用户反复进出/刷新页面不该重复付。"""
     if search and not search.startswith("#"):
         search = "#" + search
+    ckey = (username or str(getattr(peer, "id", "")), int(offset_id or 0), search)
+    hit = _page_cache.get(ckey)
+    if hit and time.monotonic() - hit[0] < PAGE_CACHE_TTL:
+        return hit[1], hit[2]
     kw = dict(search=search) if search else {}
     msgs = await client.get_messages(entity=_msg_entity(peer), limit=PAGE_SIZE, offset_id=offset_id or 0, **kw)
     msgs = list(msgs)
@@ -1073,7 +1108,14 @@ async def _fetch_page_with_groups(peer, username: str, offset_id: int = 0, searc
             # 下一页第一条已经不是同组 → 组已完整
             break
         msgs.extend(extra)
-    return _collect_items(msgs, peer, username)
+    items, next_offset = _collect_items(msgs, peer, username)
+    if len(_page_cache) >= PAGE_CACHE_MAX:
+        now = time.monotonic()
+        dead = [k for k, v in _page_cache.items() if now - v[0] >= PAGE_CACHE_TTL]
+        for k in (dead or [next(iter(_page_cache))]):
+            _page_cache.pop(k, None)
+    _page_cache[ckey] = (time.monotonic(), items, next_offset)
+    return items, next_offset
 
 
 
@@ -1288,6 +1330,9 @@ async def watch_page(req: web.Request) -> web.Response:
         from telethon import utils as _tu
         _dc_id, _loc = _tu.get_input_location(m.media)
         _spawn_bg(transfer.warm(_dc_id))
+        # 只预取开头 PRIME_BYTES（默认 2MB）到内存分块缓存：点击播放时服务端立即能吐，
+        # 浏览器不必像 preload="auto" 那样整段预载（实测开一页会后台拉 20MB+，拖慢其它请求）。
+        _spawn_bg(_prime_head(m, size, packed))
     except Exception:
         pass
     q = "?c=" + c_q
@@ -1302,11 +1347,10 @@ async def watch_page(req: web.Request) -> web.Response:
     else:
         # 微信 X5 内核：playsinline + x5-video-player-type=h5 让视频在页面内播放（而非全屏/下载）
         # 续播：localStorage 记录该视频进度（按 packed id），下次进入自动跳到上次位置
-        # preload="auto"：页面打开即开始缓冲（实测 Chrome 缓冲 13s 就停，不会拉整片），
-        # 用户点击原生播放键时数据已就位 → 立即出画面。曾用 preload="metadata"：
-        # 点击前只缓冲 0.5s，点击后才从零开始拉流，体感要等 4~8s。
-        # 不再用自定义大播放键（会与原生 controls 的播放键重叠，出现两个按钮）。
-        player = ('<video id="vmain" controls preload="auto" playsinline '
+        # preload="metadata"：不在后台狂拉（auto 会让每个播放页预载 20MB+，把列表页/缩略图拖慢）。
+        # 点击播放的即时性改由服务端保证：打开本页时已把开头 2MB 预取进内存分块缓存（_prime_head），
+        # 点击后服务端 TTFB≈0，浏览器只需从本机拉这几 MB 就能出画面。
+        player = ('<video id="vmain" controls preload="metadata" playsinline '
                   'webkit-playsinline x5-playsinline x5-video-player-type="h5" src="%s"></video>') % stream
     dl_hint = ""  # 用户要求不提供下载按钮
     name_esc = _html.escape(name, quote=True)
